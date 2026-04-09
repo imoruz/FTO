@@ -3,10 +3,7 @@ from enum import StrEnum, auto
 from typing import Any, Callable
 from fto.adapters.node.node import NodeAdapter
 from fto.const import DEFAULT_INJECTED_PROMPT
-
-
-class FaultType(StrEnum):
-    PROMPT_INJECTION=auto()
+from fto.faults import Fault
 
 
 class RestartMode(StrEnum):
@@ -18,35 +15,6 @@ class RestartMode(StrEnum):
 class CircuitState(StrEnum):
     OPEN = auto()
     CLOSED = auto()
-
-
-class Fault:
-    def __init__(self, node_id: str):
-        self.node_id = node_id
-        self.applied = False
-
-    @property
-    def mode(self):
-        pass
-
-    def apply(self):
-        self.applied = True
-
-
-class PromptInjectionFault(Fault):
-
-    def __init__(self, node_id: str, prompt: str = None, mutator: Callable = None, mutator_payload: dict[str, Any] = None):
-        super().__init__(node_id)
-        self.prompt = prompt or DEFAULT_INJECTED_PROMPT
-
-    @property
-    def mode(self):
-        return FaultType.PROMPT_INJECTION
-
-    def apply(self, node: NodeAdapter = None):
-        if not self.applied:
-            self.applied = True
-            return node.append_to_last_message(self.prompt)
 
 
 @dataclass

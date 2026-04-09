@@ -15,6 +15,10 @@ class NodeAdapter:
         pass
 
     @property
+    def last_message(self):
+        pass
+
+    @property
     def is_agent(self) -> bool:
         pass
 
@@ -23,4 +27,7 @@ class NodeAdapter:
         pass
 
     def append_to_last_message(self, text: str) -> None:
+        pass
+
+    def overwrite_last_message(self, text: str) -> None:
         pass

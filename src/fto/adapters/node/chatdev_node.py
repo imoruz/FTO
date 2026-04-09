@@ -13,6 +13,12 @@ class ChatDevNodeAdapter(NodeAdapter):
     @property
     def input(self):
         return self._inner.input
+    
+    @property
+    def last_message(self):
+        if not self.input:
+            return None
+        return self.input[-1].get("content", "")
 
     @input.setter
     def set_input(self, value):
@@ -22,11 +28,11 @@ class ChatDevNodeAdapter(NodeAdapter):
     def is_agent(self) -> bool:
         return self._inner.type == 'agent'
 
-    def append_to_last_message(node, text: str) -> bool:
+    def append_to_last_message(self, text: str) -> bool:
         from entity.messages import MessageBlock
-        if not node.input:
+        if not self.input:
             return False
-        last = node.input[-1]
+        last = self.input[-1]
         content = last.content
 
         if isinstance(content, str):
@@ -40,5 +46,26 @@ class ChatDevNodeAdapter(NodeAdapter):
                 return False
         else:
             return False
-        node.input[-1] = last.with_content(new_content)
+        self._inner.input[-1] = last.with_content(new_content)
+        return True
+    
+    def overwrite_last_message(self, text: str) -> bool:
+        from entity.messages import MessageBlock
+        if not self.input:
+            return False
+        last = self.input[-1]
+        content = last.content
+
+        if isinstance(content, str):
+            new_content = text
+        elif isinstance(content, list) and content:
+            if isinstance(content[0], MessageBlock):
+                new_content = [MessageBlock.text_block(text)]
+            elif isinstance(content[0], dict):
+                new_content = [{"type": "text", "text": text}]
+            else:
+                return False
+        else:
+            return False
+        self._inner.input[-1] = last.with_content(new_content)
         return True

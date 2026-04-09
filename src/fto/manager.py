@@ -1,7 +1,8 @@
 from copy import copy
 
 from fto.adapters.node.node import NodeAdapter
-from fto.config import Fault, RestartMode
+from fto.config import RestartMode
+from fto.faults import Fault
 
 
 class Manager:
@@ -26,13 +27,20 @@ class Manager:
     def _fault_exec(self, exec, callback = None):
 
         def _exe(instance, node):
+            print('22222222222222222')
             node_adapter: NodeAdapter = self.node_adapter(node)
+            print('3333333333333')
             if not node_adapter.is_agent:
                 exec(instance, node)
                 return
-            if not self.fault or node_adapter.id != self.fault.node_id:
+            if not self.fault:
+                self.logger.log(f"No fault injected. Running original flow.")
                 exec(instance, node)
                 return
+            if node_adapter.id != self.fault.node_id:
+                exec(instance, node)
+                return
+            print('44444444444444444444444')
             self.set_node_input(node_adapter.input)
             if not self.fault.applied:
                 self.fault.apply(node=node_adapter)
