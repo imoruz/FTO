@@ -10,7 +10,7 @@ resolution-markers = [
 [[package]]
 name = "aegis-mas"
 version = "0.1.0"
-source = { git = "https://github.com/kfq20/AEGIS.git#ced13443fd8ab373ae97e9eaae72660e8e733a22" }
+source = { editable = "../AEGIS" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -34,6 +34,39 @@ dependencies = [
     { name = "transformers" },
     { name = "wandb" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiohttp", specifier = ">=3.8.0" },
+    { name = "anthropic", specifier = ">=0.18.0" },
+    { name = "asyncio-throttle", specifier = ">=1.0.0" },
+    { name = "black", specifier = ">=22.0.0" },
+    { name = "black", marker = "extra == 'dev'", specifier = ">=22.0.0" },
+    { name = "flake8", specifier = ">=5.0.0" },
+    { name = "flake8", marker = "extra == 'dev'", specifier = ">=5.0.0" },
+    { name = "httpx", specifier = ">=0.24.0" },
+    { name = "isort", specifier = ">=5.10.0" },
+    { name = "isort", marker = "extra == 'dev'", specifier = ">=5.10.0" },
+    { name = "jsonlines", specifier = ">=3.0.0" },
+    { name = "loguru", specifier = ">=0.7.0" },
+    { name = "numpy", specifier = ">=1.21.0" },
+    { name = "openai", specifier = ">=1.0.0" },
+    { name = "pandas", specifier = ">=1.3.0" },
+    { name = "pytest", specifier = ">=7.0.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.21.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "scikit-learn", specifier = ">=1.1.0" },
+    { name = "scipy", specifier = ">=1.9.0" },
+    { name = "sphinx", marker = "extra == 'docs'", specifier = ">=5.0.0" },
+    { name = "sphinx-rtd-theme", marker = "extra == 'docs'", specifier = ">=1.0.0" },
+    { name = "torch", specifier = ">=1.10.0" },
+    { name = "tqdm", specifier = ">=4.64.0" },
+    { name = "transformers", specifier = ">=4.20.0" },
+    { name = "wandb", specifier = ">=0.15.0" },
+]
+provides-extras = ["dev", "docs"]
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -111,7 +144,7 @@ wheels = [
 
 [[package]]
 name = "anthropic"
-version = "0.92.0"
+version = "0.93.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -123,9 +156,9 @@ dependencies = [
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/01/2d/fc5c5a369db977efbaa646d77ba42b38a6de4e95789884032b0e2e3fc834/anthropic-0.92.0.tar.gz", hash = "sha256:d1e792ed0692379452a1af6b266df495e973c3695cd0aace2a108b838393cbc4", size = 652420, upload-time = "2026-04-08T16:55:35.37Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c2/70/2429d6f7c2516db99fb342c3ad89575ab3e0cd31d3d2f6cba5fdf5e9c65b/anthropic-0.93.0.tar.gz", hash = "sha256:fea8376f7d5cdf99d5e8e85a48fe7a7bd8ab307cdfee4b1e8283a18b1c0ce1b5", size = 654155, upload-time = "2026-04-09T18:13:53.522Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c3/21/bf5b5ab10b6932c5c43eaa66b6e3f256de569cf0323d89f9cc281a0d0f39/anthropic-0.92.0-py3-none-any.whl", hash = "sha256:f92a4bd065d5cab90a96b65bb44e473bf7c6fe731a743cd156e9ad1d245c381e", size = 621195, upload-time = "2026-04-08T16:55:33.639Z" },
+    { url = "https://files.pythonhosted.org/packages/c9/7b/5b2c11902707c49c7a99418eb027ed3eb63876193fee5c80b5c878e3a673/anthropic-0.93.0-py3-none-any.whl", hash = "sha256:2c20b2ce6d305564c66a6cbaedddee8efdd3b9753098bf314093fcf4c662d04c", size = 627482, upload-time = "2026-04-09T18:13:51.606Z" },
 ]
 
 [[package]]
@@ -385,7 +418,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aegis-mas", git = "https://github.com/kfq20/AEGIS.git" },
+    { name = "aegis-mas", editable = "../AEGIS" },
     { name = "ollama", specifier = ">=0.6.1" },
 ]
 
@@ -468,7 +501,7 @@ wheels = [
 
 [[package]]
 name = "huggingface-hub"
-version = "1.10.0"
+version = "1.10.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "filelock" },
@@ -481,9 +514,9 @@ dependencies = [
     { name = "typer" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/12/14/6a5fb1eafd6a2a44a821681b3781f349d249db09b615cf2d23cc3d580e4a/huggingface_hub-1.10.0.tar.gz", hash = "sha256:f803c3aae2dc98515a4341a0ce310b4e6b96ac557bb4b5fb4a77bcf525026d5b", size = 757492, upload-time = "2026-04-09T13:00:55.788Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/28/baf5d745559503ce8d28cf5bc9551f5ac59158eafd7b6a6afff0bcdb0f50/huggingface_hub-1.10.1.tar.gz", hash = "sha256:696c53cf9c2ac9befbfb5dd41d05392a031c69fc6930d1ed9671debd405b6fff", size = 758094, upload-time = "2026-04-09T15:01:18.928Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/f5/7b6362580f2bac447a816352b2c53a2f4461683ffea2862a5f14b44b3b14/huggingface_hub-1.10.0-py3-none-any.whl", hash = "sha256:012a6a9177e861147b63d11da1aed58131fb7cbf7e3cd64ad6f154cb400f00c9", size = 641856, upload-time = "2026-04-09T13:00:54.243Z" },
+    { url = "https://files.pythonhosted.org/packages/83/8c/c7a33f3efaa8d6a5bc40e012e5ecc2d72c2e6124550ca9085fe0ceed9993/huggingface_hub-1.10.1-py3-none-any.whl", hash = "sha256:6b981107a62fbe68c74374418983399c632e35786dcd14642a9f2972633c8b5a", size = 642630, upload-time = "2026-04-09T15:01:17.35Z" },
 ]
 
 [[package]]
@@ -1388,7 +1421,7 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.5.2"
+version = "5.5.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -1401,9 +1434,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typer" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6b/90/19a9466a9fd620c4706fa890f6aec1e95d935bc7735c4f7eb855039f739a/transformers-5.5.2.tar.gz", hash = "sha256:134b3cbc2f5f6cd184544456c5d7e003dffdad385a280ce501d10d9f2d7df9b7", size = 8227122, upload-time = "2026-04-09T14:04:05.276Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/af/35/cd5b0d1288e65d2c12db4ce84c1ec1074f7ee9bced040de6c9d69e70d620/transformers-5.5.3.tar.gz", hash = "sha256:3f60128e840b40d352655903552e1eed4f94ed49369a4d43e1bc067bd32d3f50", size = 8226047, upload-time = "2026-04-09T15:52:56.231Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/04/ec/fe0cecd1de5bd5ee15e9319d120154dd27fc232079b847196605dfb0eeb5/transformers-5.5.2-py3-none-any.whl", hash = "sha256:397805e2d80c3b14bd10212db1ffc1ec3d9bfed58686ac89574a275b9d13e9bd", size = 10236243, upload-time = "2026-04-09T14:04:01.68Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/0b/f8524551ab2d896dfaca74ddb70a4453d515bbf4ab5451c100c7788ae155/transformers-5.5.3-py3-none-any.whl", hash = "sha256:e48f3ec31dd96505e96e66b63a1e43e1ad7a65749e108d9227caaf51051cdb02", size = 10236257, upload-time = "2026-04-09T15:52:52.866Z" },
 ]
 
 [[package]]

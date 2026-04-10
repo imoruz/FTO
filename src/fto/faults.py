@@ -47,9 +47,11 @@ class AegisFault(Fault):
         super().__init__(node_id)
         self.factory = FMMaliciousFactory(llm=LLMAdapter(client=Client(host="http://localhost:11434")))
         self.fm_error_type = fm_error_type
+        self.agent_context = None
 
-    def set_agent_context(self, agent_context: AgentContext):
-        self.agent_context = agent_context
+    @property
+    def mode(self):
+        return self.fm_error_type
 
     def apply(self, node: NodeAdapter):
         if self.applied:
@@ -59,6 +61,6 @@ class AegisFault(Fault):
         corrupted_last_message = self.factory.inject_prompt(
             prompt=original_last_message,
             fm_error_type=self.fm_error_type,
-            agent_context=self.agent_context
+            agent_context=node.to_aegis_context()
         )
         node.overwrite_last_message(text=corrupted_last_message)

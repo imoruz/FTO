@@ -1,6 +1,6 @@
 from typing import List
 from fto.adapters.node.node import NodeAdapter
-
+from aegis_core import AgentContext
 
 class ChatDevNodeAdapter(NodeAdapter):
     def __init__(self, inner):
@@ -18,7 +18,10 @@ class ChatDevNodeAdapter(NodeAdapter):
     def last_message(self):
         if not self.input:
             return None
-        return self.input[-1].get("content", "")
+        last_content = self.input[-1].content
+        if isinstance(last_content, str):
+            return last_content
+        return last_content[-1].text
 
     @input.setter
     def set_input(self, value):
@@ -27,6 +30,19 @@ class ChatDevNodeAdapter(NodeAdapter):
     @property
     def is_agent(self) -> bool:
         return self._inner.type == 'agent'
+    
+    def to_aegis_context(self):
+        return AgentContext(
+            # role_name = self.id,
+            role_type = self._inner.type,
+            agent_id = self.id,
+            system_message = self._inner.role,
+            tools = [tool.get("name", "") for tool in self._inner.tools],
+            # external_tools = [],
+            description = self._inner.description,
+            model_type = self._inner.model_name,
+            recent_history = [msg.content for msg in self._inner.input]
+        )
 
     def append_to_last_message(self, text: str) -> bool:
         from entity.messages import MessageBlock
@@ -67,5 +83,6 @@ class ChatDevNodeAdapter(NodeAdapter):
                 return False
         else:
             return False
-        self._inner.input[-1] = last.with_content(new_content)
+        self._inner.input.pop()
+        self._inner.input.append(last.with_content(new_content))
         return True

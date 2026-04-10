@@ -15,4 +15,4 @@ dependencies = [
 packages = ["src/fto"]
 
 [tool.uv.sources]
-aegis-mas = { git = "https://github.com/kfq20/AEGIS.git" }
+aegis-mas = { path = "../AEGIS", editable = true }

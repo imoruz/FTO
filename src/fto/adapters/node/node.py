@@ -26,6 +26,9 @@ class NodeAdapter:
     def set_input(self, value):
         pass
 
+    def to_aegis_context(self):
+        pass
+
     def append_to_last_message(self, text: str) -> None:
         pass
 
