@@ -23,7 +23,6 @@ class ChatDevNodeAdapter(NodeAdapter):
             return last_content
         return last_content[-1].text
 
-    @input.setter
     def set_input(self, value):
         self._inner.input = value
 

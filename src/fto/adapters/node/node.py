@@ -22,7 +22,6 @@ class NodeAdapter:
     def is_agent(self) -> bool:
         pass
 
-    @input.setter
     def set_input(self, value):
         pass
 

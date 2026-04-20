@@ -43,15 +43,15 @@ class PromptInjectionFault(Fault):
 
 class AegisFault(Fault):
     """Class based on AEGIS to inject MAST based faults"""
-    def __init__(self, node_id, fm_error_type: FMErrorType):
+    def __init__(self, node_id, mode: FMErrorType):
         super().__init__(node_id)
         self.factory = FMMaliciousFactory(llm=LLMAdapter(client=Client(host="http://localhost:11434")))
-        self.fm_error_type = fm_error_type
+        self.fm_mode = mode
         self.agent_context = None
 
     @property
     def mode(self):
-        return self.fm_error_type
+        return self.fm_mode
 
     def apply(self, node: NodeAdapter):
         if self.applied:
@@ -60,7 +60,7 @@ class AegisFault(Fault):
         original_last_message = node.last_message
         corrupted_last_message = self.factory.inject_prompt(
             prompt=original_last_message,
-            fm_error_type=self.fm_error_type,
+            fm_error_type=self.mode,
             agent_context=node.to_aegis_context()
         )
         node.overwrite_last_message(text=corrupted_last_message)
