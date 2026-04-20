@@ -15,12 +15,21 @@ class NodeAdapter:
         pass
 
     @property
+    def last_message(self):
+        pass
+
+    @property
     def is_agent(self) -> bool:
         pass
 
-    @input.setter
     def set_input(self, value):
         pass
 
+    def to_aegis_context(self):
+        pass
+
     def append_to_last_message(self, text: str) -> None:
+        pass
+
+    def overwrite_last_message(self, text: str) -> None:
         pass
