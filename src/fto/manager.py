@@ -69,7 +69,7 @@ class Manager:
                 # restore edge propagation
                 self.restore_edge_propagator(instance, original)
             if hasattr(self.fault, "disable"):
-                # OTEL fault specific
+                # OTel fault specific
                 self.fault.disable()
 
             callback and callback(node_adapter, instance)
