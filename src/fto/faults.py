@@ -2,6 +2,7 @@ from enum import StrEnum, auto
 from typing import Any, Callable
 
 from aegis_core import AgentContext, FMMaliciousFactory, FMErrorType
+from llmmas_otel.injection import enable_fault_injection, disable_fault_injection, SpecFaultEngine, FaultSpec
 from ollama import Client
 
 from fto.adapters.node.node import NodeAdapter
@@ -15,6 +16,7 @@ class FaultType(StrEnum):
 class Fault:
     def __init__(self, node_id: str):
         self.node_id = node_id
+        self.raises_on_fault = False
         self.applied = False
 
     @property
@@ -43,9 +45,9 @@ class PromptInjectionFault(Fault):
 
 class AegisFault(Fault):
     """Class based on AEGIS to inject MAST based faults"""
-    def __init__(self, node_id, mode: FMErrorType):
+    def __init__(self, node_id, mode: FMErrorType, llm_provider: str = "ollama", llm_model: str = "mistral"):
         super().__init__(node_id)
-        self.factory = FMMaliciousFactory(llm=LLMAdapter(client=Client(host="http://localhost:11434")))
+        self.factory = FMMaliciousFactory(llm=LLMAdapter(client=Client(host="http://localhost:11434"), model=llm_model))
         self.fm_mode = mode
         self.agent_context = None
 
@@ -64,3 +66,34 @@ class AegisFault(Fault):
             agent_context=node.to_aegis_context()
         )
         node.overwrite_last_message(text=corrupted_last_message)
+
+
+class OTelFault(Fault):
+    def __init__(self, node_id: str, specs: list[dict], seed: str = "default"):
+        super().__init__(node_id)
+        self.specs = specs
+        self.seed = seed
+        self.raises_on_fault = True
+
+    @property
+    def mode(self):
+        return "otel_infra"
+    
+    def apply(self, node: NodeAdapter):
+        if self.applied:
+            return
+        self.applied = True
+        specs_with_selector = []
+        for d in self.specs:
+            if d.get("hook") == "llm_call":
+                specs_with_selector.append(d)
+            else:
+                specs_with_selector.append(
+                    {**d, "selector": {**d.get("selector", {}), "source_agent_id": self.node_id}}
+                )
+        parsed = [FaultSpec.from_dict(d) for d in specs_with_selector]
+        enable_fault_injection(SpecFaultEngine(specs=parsed, seed=self.seed))
+
+    def disable(self):
+        disable_fault_injection()
+    

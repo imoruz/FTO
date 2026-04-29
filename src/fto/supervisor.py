@@ -15,6 +15,7 @@ class Supervisor:
         )
         self.node_states = {node_id: CircuitState.CLOSED for node_id in node_ids}
         self.checkpoint = fto_config.checkpoint
+        self.instrumentation = fto_config.instrumentation
 
         self.patch_target = fto_config.patch_target
         self.patch_method = fto_config.patch_method
@@ -30,6 +31,11 @@ class Supervisor:
 
     def start(self):
         self.logger.log("Started supervisor.")
+        # apply framework-specific otel patches
+        if self.instrumentation:
+            self.instrumentation()
+            # recapture so the fault executor calls the OTEL patch
+            self._original_node_exec = getattr(self.patch_target, self.patch_method)
         if self.checkpoint:
             self.checkpoint.save_baseline()
         self._patch(

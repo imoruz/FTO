@@ -31,3 +31,4 @@ class FTOConfig:
     restore_edge_propagator: Callable | None = None
     logger: Any = None
     checkpoint: Checkpoint | None = None
+    instrumentation: Callable | None = None

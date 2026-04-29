@@ -8,6 +8,7 @@ version = "0.1.0"
 requires-python = "==3.12.*"
 dependencies = [
     "aegis-mas",
+    "llmmas-otel",
     "ollama>=0.6.1",
 ]
 
@@ -16,3 +17,4 @@ packages = ["src/fto"]
 
 [tool.uv.sources]
 aegis-mas = { path = "../AEGIS", editable = true }
+llmmas-otel = { git = "https://github.com/vagabondboffin/llmmas-otel.git" }

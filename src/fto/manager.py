@@ -33,11 +33,6 @@ class Manager:
             if not node_adapter.is_agent:
                 exec(instance, node)
                 return
-            
-            # Checkpoint before agent node executes so we can rollback here on restart
-            if self.checkpoint:
-                self.checkpoint.save(node_id=node_adapter.id)
-                self.logger.log(f"Created checkpoint for {node_adapter.id}.")
 
             if not self.fault:
                 self.logger.log(f"No fault injected. Running original flow.")
@@ -46,6 +41,11 @@ class Manager:
             if node_adapter.id != self.fault.node_id:
                 exec(instance, node)
                 return
+            
+            # Checkpoint before agent node executes so we can rollback here on restart
+            if self.checkpoint:
+                self.checkpoint.save(node_id=node_adapter.id)
+                self.logger.log(f"Created checkpoint for {node_adapter.id}.", instance=instance, node_id=node_adapter.id)
             
             if self.restart:
                 self.restart.set_context(node_adapter.input)
@@ -58,10 +58,19 @@ class Manager:
             original = self.get_edge_propagator(instance)
             self.suppress_edge_propagator(instance)
 
-            exec(instance, node)
-            self.logger.log("Faulty execution completed.", instance=instance, node_id=node_adapter.id)
-            # restore edge propagation
-            self.restore_edge_propagator(instance, original)
+            try:
+                exec(instance, node)
+                self.logger.log("Faulty execution completed.", instance=instance, node_id=node_adapter.id)
+            except Exception as e:
+                if not self.fault.raises_on_fault:
+                    raise
+                self.logger.log(f"Faulty execution raised: {e.__repr__()}", instance=instance, node_id=node_adapter.id)
+            finally:
+                # restore edge propagation
+                self.restore_edge_propagator(instance, original)
+            if hasattr(self.fault, "disable"):
+                # OTel fault specific
+                self.fault.disable()
 
             callback and callback(node_adapter, instance)
 
