@@ -65,4 +65,4 @@ class GitBranchCheckpoint(Checkpoint):
         self._git("branch", "-f", self._ref(node_id), "HEAD")
 
     def restore(self, node_id: str):
-        self._git("restore", "--source", self._ref(node_id), "--worktree", "--", ".")
+        self._git("restore", "--source", self._ref(node_id), "--worktree", "--", ":/")

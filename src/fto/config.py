@@ -1,7 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import Any, Callable
 from fto.adapters.node.node import NodeAdapter
+from fto.edge import EdgeSuppressor
 from fto.faults import Fault
 from fto.recovery import Restart
 from fto.recovery.checkpoint import Checkpoint
@@ -21,14 +22,9 @@ class CircuitState(StrEnum):
 @dataclass
 class FTOConfig:
 
-    node_adapter: NodeAdapter
-    patch_target: Any
-    patch_method: Any
     fault: Fault | None = None
     restart: Restart | None = None
-    get_edge_propagator: Callable | None = None
-    suppress_edge_propagator: Callable | None = None
-    restore_edge_propagator: Callable | None = None
+    edge_suppressor: EdgeSuppressor = field(default_factory=EdgeSuppressor)
     logger: Any = None
     checkpoint: Checkpoint | None = None
     instrumentation: Callable | None = None
