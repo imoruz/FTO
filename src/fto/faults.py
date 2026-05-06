@@ -1,6 +1,6 @@
 from enum import Enum, StrEnum, auto
 
-from aegis_core import FMMaliciousFactory, FMErrorType
+from aegis_mas.aegis_core import FMMaliciousFactory, FMErrorType
 from llmmas_otel.injection import (
     enable_fault_injection,
     disable_fault_injection,

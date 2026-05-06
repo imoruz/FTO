@@ -1,7 +1,7 @@
 from typing import Any
 
 from fto.adapters.node.node import NodeAdapter
-from aegis_core import AgentContext
+from aegis_mas.aegis_core import AgentContext
 
 
 class ChatDevNodeAdapter(NodeAdapter):
