@@ -1,7 +1,6 @@
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import Any, Callable
-from fto.adapters.node.node import NodeAdapter
 from fto.edge import EdgeSuppressor
 from fto.faults import Fault
 from fto.recovery import Restart
@@ -14,17 +13,11 @@ class RestartMode(StrEnum):
     REFINED_HISTORY = auto()
 
 
-class CircuitState(StrEnum):
-    OPEN = auto()
-    CLOSED = auto()
-
-
 @dataclass
 class FTOConfig:
-
     fault: Fault | None = None
     restart: Restart | None = None
     edge_suppressor: EdgeSuppressor = field(default_factory=EdgeSuppressor)
     logger: Any = None
     checkpoint: Checkpoint | None = None
-    instrumentation: Callable | None = None
+    instrumentation: Callable[..., Any] | None = None
