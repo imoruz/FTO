@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "FTO"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "aegis-mas",
+    "llmmas-otel",
+    "ollama>=0.6.1",
+    "ruff>=0.15.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fto"]
+
+[tool.uv.sources]
+aegis-mas = { git = "https://github.com/imoruz/AEGIS.git" }
+llmmas-otel = { git = "https://github.com/vagabondboffin/llmmas-otel.git" }
