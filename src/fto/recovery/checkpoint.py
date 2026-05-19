@@ -23,6 +23,10 @@ class GitBranchCheckpoint(Checkpoint):
         self.run_id = run_id
         self.branch_prefix = f'FTO-{self.run_id}'
 
+        # init git if needed
+        if not self._is_git_repo():
+            self._git('init')
+
     def _git(self, *args) -> subprocess.CompletedProcess[str]:
         try:
             return subprocess.run(
@@ -37,6 +41,13 @@ class GitBranchCheckpoint(Checkpoint):
                 e.returncode, e.cmd, e.output, f'stderr: {e.stderr.strip()}'
             ) from None
 
+    def _is_git_repo(self) -> bool:
+        try:
+            self._git('rev-parse', '--is-inside-work-tree')
+            return True
+        except subprocess.CalledProcessError:
+            return False
+    
     def _is_dirty(self) -> bool:
         result = subprocess.run(
             ['git', 'status', '--porcelain'],
