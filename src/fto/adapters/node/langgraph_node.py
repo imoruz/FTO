@@ -20,10 +20,10 @@ class LangGraphNodeAdapter(NodeAdapter):
 
     @property
     def input(self) -> Any:
-        return self._task.input.get('messages', [])
+        return self._task.input.messages
 
     def set_input(self, msgs: Any) -> None:
-        self._task.input['messages'] = msgs
+        self._task.input.messages = msgs
 
     @property
     def last_message(self) -> Any:
@@ -42,13 +42,13 @@ class LangGraphNodeAdapter(NodeAdapter):
         )
 
     def append_to_last_message(self, text: str) -> None:
-        msgs = self._task.input['messages']
+        msgs = self._task.input.messages
         if msgs:
             from langchain_core.messages import AIMessage
 
             msgs.append(AIMessage(content=text))
 
     def overwrite_last_message(self, text: str) -> None:
-        msgs = self._task.input['messages']
+        msgs = self._task.input.messages
         if msgs:
             msgs[-1] = msgs[-1].copy(update={'content': text})
