@@ -2,6 +2,17 @@ from pathlib import Path
 import subprocess
 
 
+_FTO_EXCLUDE_PATTERNS = [
+    'execution_logs.json',
+    'fto_execution_logs.json',
+    'fto.log',
+    'node_outputs.yaml',
+    'workflow_summary.yaml',
+    'token_usage_*.json',
+    'traces.jsonl',
+]
+
+
 class Checkpoint:
     def __init__(self) -> None:
         pass
@@ -23,9 +34,10 @@ class GitBranchCheckpoint(Checkpoint):
         self.run_id = run_id
         self.branch_prefix = f'FTO-{self.run_id}'
 
-        # init git if needed
         if not self._is_git_repo():
             self._git('init')
+
+        self._write_local_excludes()
 
     def _git(self, *args) -> subprocess.CompletedProcess[str]:
         try:
@@ -37,17 +49,31 @@ class GitBranchCheckpoint(Checkpoint):
                 text=True,
             )
         except subprocess.CalledProcessError as e:
-            raise subprocess.CalledProcessError(
-                e.returncode, e.cmd, e.output, f'stderr: {e.stderr.strip()}'
+            stderr = e.stderr.strip() if e.stderr else ''
+            raise RuntimeError(
+                f"git {' '.join(str(a) for a in args)} failed "
+                f"(exit {e.returncode})"
+                + (f': {stderr}' if stderr else '')
             ) from None
+
+    def _write_local_excludes(self) -> None:
+        """Write FTO framework files to .git/info/exclude so they are never committed."""
+        exclude_file = self.repo_path / '.git' / 'info' / 'exclude'
+        exclude_file.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude_file.read_text(encoding='utf-8') if exclude_file.exists() else ''
+        additions = [p for p in _FTO_EXCLUDE_PATTERNS if p not in existing]
+        if additions:
+            with exclude_file.open('a', encoding='utf-8') as f:
+                f.write('\n# FTO framework files\n')
+                f.write('\n'.join(additions) + '\n')
 
     def _is_git_repo(self) -> bool:
         try:
             self._git('rev-parse', '--is-inside-work-tree')
             return True
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, RuntimeError):
             return False
-    
+
     def _is_dirty(self) -> bool:
         result = subprocess.run(
             ['git', 'status', '--porcelain'],
