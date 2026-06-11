@@ -12,9 +12,12 @@ class Supervisor:
             edge_suppressor=fto_config.edge_suppressor,
             logger=fto_config.logger,
             checkpoint=fto_config.checkpoint,
+            observer=fto_config.observer,
         )
         self.checkpoint = fto_config.checkpoint
         self.instrumentation = fto_config.instrumentation
+        self.observer = fto_config.observer
+        self.probe = fto_config.probe
 
         self.logger = fto_config.logger
 
@@ -22,7 +25,9 @@ class Supervisor:
         self, target: Any, function_name: str, make_adapter: Callable[..., Any]
     ) -> None:
         self.logger.info('Started supervisor.')
-        # apply framework-specific OTel patches
+        if self.observer is not None and self.probe:
+            self.probe.install()
+        # apply framework-specific OTel patches (now wrapping the probes)
         if self.instrumentation:
             self.instrumentation()
         # recapture so the fault executor calls the OTel patch or original function if not patched
