@@ -56,8 +56,7 @@ class AegisFault(Fault):
         mode: FMErrorType,
         idx_step: int,
         node_id: str = None,
-        llm_provider: str = 'ollama',
-        llm_model: str = 'mistral',
+        llm_model: str = 'solar:10.7b',
     ) -> None:
         super().__init__(idx_step=idx_step, node_id=node_id)
         self.factory = FMMaliciousFactory(
