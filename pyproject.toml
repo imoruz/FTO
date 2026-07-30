@@ -19,3 +19,13 @@ packages = ["src/fto"]
 [tool.uv.sources]
 aegis-mas = { git = "https://github.com/imoruz/AEGIS.git" }
 llmmas-otel = { git = "https://github.com/vagabondboffin/llmmas-otel.git" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]

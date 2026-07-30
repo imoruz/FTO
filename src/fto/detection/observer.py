@@ -42,12 +42,17 @@ class Observer:
     """
 
     def __init__(self, inspector: ContextInspector | None = None,
-                 timeout_s: float | None = None, logger=None,
+                 timeout_node: float | None = None,
+                 timeout_llm: float | None = None,
+                 timeout_tool: float | None = None,
+                 logger=None,
                  record_injected_faults: bool = False,
                  restart_timing: RestartTiming | str = RestartTiming.DEFERRED,
                  restart_codes: set[int] | None = None, restart_sites: set[str] | None = None, restart_families: set[str] | None = None):
         self.inspector = inspector if inspector is not None else ContextInspector()
-        self.timeout_s = timeout_s
+        self.timeout_node = timeout_node
+        self.timeout_llm = timeout_llm
+        self.timeout_tool = timeout_tool
         self.logger = logger
         # Explicitly record injected faults flag (if False, tries to detect them instead)
         self.record_injected_faults = record_injected_faults
@@ -106,7 +111,7 @@ class Observer:
         """Run the node. Inner exceptions are recorded by the probes and
         (usually) swallowed by the framework, so they surface as Detections in
         the active scope rather than as raises here."""
-        if self.timeout_s is None:
+        if self.timeout_node is None:
             try:
                 return callable(*args, **kwargs)
             except KillNode:
@@ -120,23 +125,27 @@ class Observer:
                 return None
 
         ctx = contextvars.copy_context()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(ctx.run, callable, *args, **kwargs)
-            try:
-                return fut.result(timeout=self.timeout_s)
-            except concurrent.futures.TimeoutError:
-                DetectionSink.record(
-                    Detection(status(504), 'node',
-                              detail=f'node hang > {self.timeout_s}s')
-                )
-                return None
-            except KillNode:
-                return None
-            except KeyboardInterrupt:
-                raise
-            except BaseException as exc:
-                DetectionSink.record(classify_exception(exc, 'node'))
-                return None
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fut = executor.submit(ctx.run, callable, *args, **kwargs)
+        try:
+            return fut.result(timeout=self.timeout_node)
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False)
+            DetectionSink.record(
+                Detection(status(504), 'node',
+                          detail=f'node hang > {self.timeout_node}s')
+            )
+            return None
+        except KillNode:
+            executor.shutdown(wait=False)
+            return None
+        except KeyboardInterrupt:
+            executor.shutdown(wait=False)
+            raise
+        except BaseException as exc:
+            executor.shutdown(wait=False)
+            DetectionSink.record(classify_exception(exc, 'node'))
+            return None
 
     def should_restart(self, detections: List[Detection]) -> bool:
         if not self.restart_config.configured:

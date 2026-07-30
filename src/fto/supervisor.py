@@ -26,7 +26,10 @@ class Supervisor:
     ) -> None:
         self.logger.info('Started supervisor.')
         if self.observer is not None and self.probe:
-            self.probe.install()
+            self.probe.install(
+                timeout_llm=self.observer.timeout_llm,
+                timeout_tool=self.observer.timeout_tool,
+            )
         # apply framework-specific OTel patches (now wrapping the probes)
         if self.instrumentation:
             self.instrumentation()
