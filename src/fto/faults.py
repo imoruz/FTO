@@ -1,3 +1,4 @@
+import os
 from enum import Enum, StrEnum, auto
 
 from aegis_mas.aegis_core import FMMaliciousFactory, FMErrorType
@@ -57,11 +58,13 @@ class AegisFault(Fault):
         idx_step: int,
         node_id: str = None,
         llm_model: str = 'solar:10.7b',
+        llm_host: str = None,
     ) -> None:
         super().__init__(idx_step=idx_step, node_id=node_id)
+        host = llm_host or os.environ.get('AEGIS_OLLAMA_HOST', 'http://localhost:11434')
         self.factory = FMMaliciousFactory(
             llm=LLMAdapter(
-                client=Client(host='http://localhost:11434'), model=llm_model
+                client=Client(host=host), model=llm_model
             )
         )
         self.fm_mode = mode
