@@ -8,6 +8,7 @@ version = "0.1.0"
 requires-python = "==3.12.*"
 dependencies = [
     "aegis-mas",
+    "litellm>=1.98.0",
     "llmlingua>=0.2.2",
     "llmmas-otel",
     "ollama>=0.6.1",

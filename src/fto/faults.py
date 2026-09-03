@@ -11,7 +11,7 @@ from llmmas_otel.injection import (
 from ollama import Client
 
 from fto.adapters.node.node import NodeAdapter
-from fto.utils import LLMAdapter
+from fto.utils import get_llm
 
 
 class FaultType(StrEnum):
@@ -57,15 +57,15 @@ class AegisFault(Fault):
         mode: FMErrorType,
         idx_step: int,
         node_id: str = None,
+        llm_provider: str = 'ollama',
         llm_model: str = 'solar:10.7b',
         llm_host: str = None,
+        llm_api_key: str = None,
+        # llm_adapter: 
     ) -> None:
         super().__init__(idx_step=idx_step, node_id=node_id)
-        host = llm_host or os.environ.get('AEGIS_OLLAMA_HOST', 'http://localhost:11434')
         self.factory = FMMaliciousFactory(
-            llm=LLMAdapter(
-                client=Client(host=host), model=llm_model
-            )
+            llm=get_llm(llm_provider, llm_model, llm_host, llm_api_key)
         )
         self.fm_mode = mode
         self.agent_context = None
