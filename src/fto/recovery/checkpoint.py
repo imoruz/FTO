@@ -84,9 +84,18 @@ class GitBranchCheckpoint(Checkpoint):
         return bool(result.stdout.strip())
 
     def _commit_if_dirty(self, msg: str) -> bool:
-        if self._is_dirty():
-            self._git('add', '-A')
-            self._git('commit', '-m', msg)
+        if not self._is_dirty():
+            return
+        self._git('add', '-A')
+        # `git status --porcelain` can flag things (e.g. submodule content
+        # changes) that `git add -A` doesn't actually stage, leaving nothing
+        # to commit. Re-check the index instead of assuming staging worked.
+        staged = subprocess.run(
+            ['git', 'diff', '--cached', '--quiet'], cwd=self.repo_path
+        )
+        if staged.returncode == 0:
+            return
+        self._git('commit', '-m', msg)
 
     def _ref(self, node_id: str) -> str:
         return f'{self.branch_prefix}-{node_id}'
