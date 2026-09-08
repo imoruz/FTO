@@ -1,5 +1,6 @@
 from copy import deepcopy
 from typing import Any
+from llmlingua import PromptCompressor
 
 
 class Restart:
@@ -27,7 +28,7 @@ class RestartNoContext(Restart):
         super().__init__(restart_count)
 
     def get_context(self) -> Any:
-        return None
+        return []
 
 
 class RestartRefinedContext(Restart):
@@ -40,3 +41,18 @@ class RestartRefinedContext(Restart):
         # based on just a summary.
         #
         pass
+    def _compress(self):
+
+        llm_lingua = PromptCompressor()
+        # compressed_prompt = llm_lingua.compress_prompt(
+        #     prompt_list,
+        #     question=question,
+        #     rate=0.55,
+        #     # Set the special parameter for LongLLMLingua
+        #     condition_in_question="after_condition",
+        #     reorder_context="sort",
+        #     dynamic_context_compression_ratio=0.3, # or 0.4
+        #     condition_compare=True,
+        #     context_budget="+100",
+        #     rank_method="longllmlingua",
+        # )
