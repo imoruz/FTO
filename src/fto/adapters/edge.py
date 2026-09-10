@@ -8,6 +8,14 @@ class EdgeSuppressor:
     def restore(self, token: Tuple[Any, Any], *args, **kwargs) -> None:
         pass
 
+    def reset(self, token: Tuple[Any, Any], *args, **kwargs) -> None:
+        """Discard what has been withheld so far, keeping suppression on.
+
+        Called between attempts at the same node, so that only the attempt
+        that actually happened last gets released downstream.
+        """
+        pass
+
 
 class MethodSwapEdgeSuppressor(EdgeSuppressor):
     def __init__(self, instance_from_args: Callable[..., Any], method_name: str) -> None:
@@ -34,6 +42,19 @@ class MethodSwapEdgeSuppressor(EdgeSuppressor):
               captured[key] = (edge_link, msg, from_node, a, kw)  # keep last run's msgs
           setattr(instance, self._method_name, _capture)
           return (instance, original, captured, order)
+
+    def reset(self, token, *args, **kwargs):
+        """Drop the previous attempt's edges before the node runs again.
+
+        Captures accumulate keyed by target node, so without this a restarted
+        node that routes somewhere new leaves the faulty attempt's edge in
+        place for its old target -- and `restore` then releases both. A
+        faulty "we are done" would reach the exit node alongside the
+        restarted node's real output.
+        """
+        _, _, captured, order = token
+        captured.clear()
+        order.clear()
 
     def restore(self, token, *args, **kwargs):
         instance, original, captured, order = token

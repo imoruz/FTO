@@ -1,5 +1,6 @@
 import pytest
 
+from fto.adapters.edge import MethodSwapEdgeSuppressor
 from fto.detection.atp import status
 from fto.detection.detection import Detection
 from fto.instrumentation import take_detections, take_injection
@@ -74,6 +75,7 @@ class FakeEdgeSuppressor:
     def __init__(self):
         self.suppress_calls = []
         self.restore_calls = []
+        self.reset_calls = []
 
     def suppress(self, *args, **kwargs):
         self.suppress_calls.append((args, kwargs))
@@ -81,6 +83,9 @@ class FakeEdgeSuppressor:
 
     def restore(self, token, *args, **kwargs):
         self.restore_calls.append((token, args, kwargs))
+
+    def reset(self, token, *args, **kwargs):
+        self.reset_calls.append((token, args, kwargs))
 
 
 class FakeCheckpoint:
@@ -672,3 +677,124 @@ class TestRestartWithRefinedContext:
         assert adapter.set_input_calls == [
             [('user', 'the plan'), ('user', 'the review')]
         ]
+
+
+class FakeEdgeLink:
+    def __init__(self, target):
+        self.target = target
+
+
+class EdgeRecorder:
+    """Stands in for the framework method that hands a message to an edge.
+
+    The framework calls it for *every* outgoing edge and evaluates the edge
+    condition inside, so a node's captured target set is its whole static edge
+    set -- it does not depend on which edge would actually fire.
+    """
+
+    def __init__(self):
+        self.delivered = []
+
+    def send(self, edge_link, msg, from_node, *args, **kwargs):
+        self.delivered.append((edge_link.target, msg))
+
+
+class TestRestartEdgeIsolation:
+    """Only the attempt that ran last may reach the successors."""
+
+    def _setup(self, attempts, restart_count=1):
+        """`attempts` is one (edge targets, message) pair per node execution."""
+        recorder = EdgeRecorder()
+        suppressor = MethodSwapEdgeSuppressor(lambda *a, **kw: recorder, 'send')
+        manager = make_manager(
+            fault=FakeFault(idx_step=1),
+            restart=FakeRestart(restart_count=restart_count, contexts=['restored']),
+            edge_suppressor=suppressor,
+        )
+        remaining = list(attempts)
+
+        def run_node():
+            targets, msg = remaining.pop(0)
+            for target in targets:
+                recorder.send(FakeEdgeLink(target), msg, 'Planner')
+            return msg
+
+        return manager, recorder, run_node
+
+    def test_the_restarted_output_replaces_the_faulty_one(self):
+        # The common case, and the one the capture dict already handled: both
+        # attempts touch the same edges, so the second write wins.
+        manager, recorder, run_node = self._setup([
+            (['FINAL', 'Coder'], 'faulty plan'),
+            (['FINAL', 'Coder'], 'good plan'),
+        ])
+
+        manager._run_injection_only(run_node, FakeAdapter(id='Planner'))
+
+        assert {msg for _, msg in recorder.delivered} == {'good plan'}
+
+    def test_a_restart_that_emits_nothing_releases_nothing(self):
+        # The asymmetry that does bite: a node produces no output at all, so
+        # the restarted attempt touches no edge and overwrites nothing. Its
+        # predecessor's captures would otherwise still be sitting there, and
+        # the faulty message would be delivered as if it were the result.
+        manager, recorder, run_node = self._setup([
+            (['FINAL', 'Coder'], 'faulty plan'),
+            ([], ''),
+        ])
+
+        manager._run_injection_only(run_node, FakeAdapter(id='Planner'))
+
+        assert recorder.delivered == []
+
+    def test_only_the_final_attempt_of_several_is_released(self):
+        # Needs the Observer path: without one, _restart returns after a
+        # single re-execution however large the restart budget.
+        recorder = EdgeRecorder()
+        attempts = [
+            (['Coder'], 'faulty plan'),
+            (['Coder'], 'second attempt'),
+            ([], ''),
+        ]
+        manager = make_manager(
+            restart=FakeRestart(restart_count=2, contexts=['c1', 'c2']),
+            edge_suppressor=MethodSwapEdgeSuppressor(lambda *a, **kw: recorder, 'send'),
+            observer=FakeObserver(
+                detections_by_call=[[make_detection(500)], [make_detection(500)], []],
+                restart_decision=True,
+            ),
+        )
+
+        def run_node():
+            targets, msg = attempts.pop(0)
+            for target in targets:
+                recorder.send(FakeEdgeLink(target), msg, 'Planner')
+            return msg
+
+        manager._run_observed(run_node, FakeAdapter(id='Planner'))
+
+        assert attempts == []  # all three executions ran
+        assert recorder.delivered == []
+
+    def test_each_attempt_starts_from_a_clean_capture(self):
+        edge_suppressor = FakeEdgeSuppressor()
+        manager = make_manager(
+            restart=FakeRestart(restart_count=3, contexts=['c1', 'c2', 'c3']),
+            edge_suppressor=edge_suppressor,
+            observer=FakeObserver(
+                detections_by_call=[[make_detection(500)], [make_detection(500)], []],
+                restart_decision=True,
+            ),
+        )
+
+        manager._restart(lambda: 'ok', FakeAdapter(id='n1'), token='token')
+
+        assert [call[0] for call in edge_suppressor.reset_calls] == ['token'] * 3
+
+    def test_no_reset_is_attempted_when_nothing_was_suppressed(self):
+        edge_suppressor = FakeEdgeSuppressor()
+        manager = make_manager(restart=FakeRestart(), edge_suppressor=edge_suppressor)
+
+        manager._restart(lambda: 'ok', FakeAdapter(id='n1'), token=None)
+
+        assert edge_suppressor.reset_calls == []

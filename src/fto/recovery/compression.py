@@ -11,6 +11,7 @@ entry -- the caller maps each compressed entry back onto the message it came
 from, which is what lets roles, sources and attachments survive compression.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -20,7 +21,43 @@ LLMLINGUA2_MODEL = 'microsoft/llmlingua-2-xlm-roberta-large-meetingbank'
 LONGLLMLINGUA_MODEL = 'NousResearch/Llama-2-7b-hf'
 
 # Structural characters worth keeping so compressed history stays readable.
-DEFAULT_FORCE_TOKENS = ['\n', '.', ':', '?', '!']
+# '.' is deliberately absent: forcing it makes LLMLingua-2 re-join it as its
+# own word, which turns "6.4.6" into "6. 4. 6" and "cpe.go" into "cpe. go".
+STRUCTURAL_FORCE_TOKENS = ['\n', ':', '?', '!']
+
+# Words whose loss inverts a requirement. Token pruning drops function words
+# by design, which turns "must never emit fortios" into "emit fortios" and
+# "No changes to tests" into "changes tests" -- a compressed instruction that
+# says the opposite of the original is worse than one that says less, so these
+# are pinned. Matching is case-sensitive, hence the sentence-initial variants.
+NEGATION_FORCE_TOKENS = [
+    'not',
+    'Not',
+    'no',
+    'No',
+    'none',
+    'None',
+    'never',
+    'Never',
+    'only',
+    'Only',
+    'must',
+    'Must',
+    'cannot',
+    'Cannot',
+    'without',
+    'except',
+    'unless',
+]
+
+DEFAULT_FORCE_TOKENS = STRUCTURAL_FORCE_TOKENS + NEGATION_FORCE_TOKENS
+
+# Spans token pruning must not touch: fenced code blocks and inline backtick
+# spans. Pruned code is not merely shorter, it is wrong -- `cpe.go` comes back
+# as `cpe.`, "cpe:2.3:h:fortinet:%s" as ":2.:fortinet:", "6.4.6" as "6. 4. 6"
+# -- leaving the node a path or literal that looks real and is not. Unlike
+# force_tokens, this protection applies in both LLMLingua modes.
+PROTECTED_SPANS = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
 
 
 @dataclass
@@ -98,6 +135,23 @@ def _default_device() -> str:
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+def _reassemble(plan: List[List]) -> str:
+    """Put an entry's pieces back together.
+
+    The compressor strips the whitespace around a fragment it was given, so a
+    single space goes back wherever that would otherwise weld a compressed
+    word onto the code span next to it.
+    """
+    out: List[str] = []
+    for _, fragment in plan:
+        if not fragment:
+            continue
+        if out and not out[-1][-1:].isspace() and not fragment[:1].isspace():
+            out.append(' ')
+        out.append(fragment)
+    return ''.join(out)
+
+
 @dataclass
 class LLMLinguaCompressor(ContextCompressor):
     """Token pruning via LLMLingua (Microsoft Research).
@@ -113,6 +167,11 @@ class LLMLinguaCompressor(ContextCompressor):
     ``question``: the v1 API only ever returns one flat string, so per-entry
     calls are what keeps entries separable. ``force_tokens`` is not supported
     upstream in this mode and is ignored.
+
+    With ``protect_code`` (the default) only prose reaches the model: fenced
+    code blocks and inline backtick spans are cut out, held aside, and put
+    back where they were. Each entry therefore becomes several fragments, so
+    the model scores each run of prose without the code around it.
 
     Failures are deliberately not swallowed: a silent fallback to uncompressed
     text would make a refined restart indistinguishable from an all-context
@@ -131,6 +190,9 @@ class LLMLinguaCompressor(ContextCompressor):
     force_tokens: List[str] = field(default_factory=lambda: list(DEFAULT_FORCE_TOKENS))
     force_reserve_digit: bool = True
     drop_consecutive: bool = False
+    # Keep fenced code blocks and backtick spans out of the compressor.
+    # Turn it off only to measure what protection is worth.
+    protect_code: bool = True
     # Escape hatch for anything else ``compress_prompt`` accepts.
     params: Dict[str, Any] = field(default_factory=dict)
 
@@ -142,27 +204,55 @@ class LLMLinguaCompressor(ContextCompressor):
 
     def compress(self, contexts: List[str], question: str = '') -> CompressionResult:
         entries = [text if isinstance(text, str) else '' for text in contexts]
-        # Entries with nothing to compress (empty, attachment-only, tool
-        # protocol) stay put and are never handed to the model.
-        indices = [i for i, text in enumerate(entries) if text.strip()]
-        if not indices:
+        plans = [self._plan(text) for text in entries]
+
+        # Every prose fragment across every entry, in order. Entries with
+        # nothing to compress (empty, attachment-only, tool protocol, or
+        # nothing but code) contribute none and are never shown to the model.
+        todo = [
+            (i, j)
+            for i, plan in enumerate(plans)
+            for j, (compressible, fragment) in enumerate(plan)
+            if compressible and fragment.strip()
+        ]
+        if not todo:
             return CompressionResult(entries)
 
-        payload = [entries[i] for i in indices]
+        payload = [plans[i][j][1] for i, j in todo]
         compressed = (
             self._compress_batch(payload)
             if self.use_llmlingua2
             else self._compress_each(payload, question)
         )
+        for (i, j), text in zip(todo, compressed):
+            plans[i][j][1] = text
 
-        texts = list(entries)
-        for i, text in zip(indices, compressed):
-            texts[i] = text
+        texts = [_reassemble(plan) for plan in plans]
         return CompressionResult(
             texts,
-            origin_tokens=self._count(payload),
-            compressed_tokens=self._count(compressed),
+            # Counted over whole entries, protected spans included, so the
+            # ratio reports the reduction the node actually sees.
+            origin_tokens=self._count(entries),
+            compressed_tokens=self._count(texts),
         )
+
+    def _plan(self, text: str) -> List[List]:
+        """Cut one entry into alternating [compressible, fragment] pieces."""
+        if not text:
+            return []
+        if not self.protect_code:
+            return [[True, text]]
+
+        pieces: List[List] = []
+        at = 0
+        for span in PROTECTED_SPANS.finditer(text):
+            if span.start() > at:
+                pieces.append([True, text[at : span.start()]])
+            pieces.append([False, span.group()])
+            at = span.end()
+        if at < len(text):
+            pieces.append([True, text[at:]])
+        return pieces
 
     def _compress_batch(self, contexts: List[str]) -> List[str]:
         result = self._compressor().compress_prompt(

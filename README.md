@@ -10,7 +10,7 @@ Supported MAS frameworks: **LangGraph** and **ChatDev**.
 
 - **Fault injection** — prompt injection, AEGIS-based corruption, or OTel infrastructure faults
 - **Fault detection (Observer)** — observes node execution and emits `Detection`s carrying [ATP](#the-atp-protocol) status codes; drives restart decisions and annotates OTel spans
-- **Edge suppression** — prevents side effects from propagating during faulty execution
+- **Edge suppression** — prevents side effects from propagating during faulty execution; withheld messages are dropped between restart attempts, so a node that ends up producing no output releases nothing rather than the previous attempt's message
 - **Checkpointing** — saves state before a fault and restores it before restart (git-branch-based)
 - **Restart** — re-executes the faulted node with original, empty, or refined context
 
@@ -74,7 +74,7 @@ For each intercepted node execution:
 4. Suppress edges (prevent side-effect propagation)
 5. Run the node — under an open detection scope when an `Observer` is attached, so inner probes, the hang watchdog and exception classifier emit `Detection`s
 6. Restore edges, disable fault
-7. Decide restart: if a fault was injected, or the Observer flags a restartable detection (and a restart is configured), restore checkpoint, set context, and re-run the node
+7. Decide restart: if a fault was injected, or the Observer flags a restartable detection (and a restart is configured), restore checkpoint, set context, and re-run the node — discarding what the previous attempt withheld, so only the last attempt can release anything downstream
 
 Without an `Observer`, only an injected fault can trigger recovery; with one, real (detected) faults can too.
 
@@ -158,16 +158,17 @@ untouched so their pairing stays intact. That is what keeps the refined
 context a valid input for the same node.
 
 ```python
-from fto.recovery import LLMLinguaCompressor, RestartRefinedContext
+from fto.recovery import DEFAULT_FORCE_TOKENS, LLMLinguaCompressor, RestartRefinedContext
 
 restart = RestartRefinedContext(
     restart_count=2,
     keep_last=1,
     compressor=LLMLinguaCompressor(
-        rate=0.55,                            # fraction of tokens to keep
-        force_tokens=['\n', '.', ':', 'TASK_COMPLETE'],  # never dropped
+        rate=0.55,          # fraction of tokens to keep
+        protect_code=True,  # hold code out of the compressor (default)
+        force_tokens=[*DEFAULT_FORCE_TOKENS, 'TASK_COMPLETE'],  # never dropped
     ),
-    logger=logger,                            # logs the compression ratio
+    logger=logger,          # logs the compression ratio
 )
 ```
 
@@ -179,11 +180,31 @@ conditioned on the kept-verbatim one but needs a 7B causal model and ignores
 `force_tokens`. The model loads lazily on first use and is then reused, and
 each snapshot is compressed once however many restart attempts follow.
 
-Which strings are load-bearing enough to force-keep is a property of the
-target MAS's prompts, not of FTO, so pass them in from the experiment side.
-Anything else `compress_prompt` accepts goes through `params`. Compression
-failures are raised, never swallowed: a silent fallback to uncompressed text
-would make a refined restart indistinguishable from an all-context one.
+**Two ways token pruning goes wrong on agent context**, both guarded by
+default:
+
+- *Code becomes plausible nonsense.* Pruned, `` `cpe.go` `` comes back as
+  `` `cpe.` ``, `cpe:2.3:h:fortinet:%s` as `:2.:fortinet:`, `6.4.6` as
+  `6. 4. 6` — the node is left holding a path or literal that looks real and
+  is not. `protect_code` (default on) cuts fenced code blocks and inline
+  backtick spans out of each message, compresses only the prose between them,
+  and puts them back where they were. It applies in both LLMLingua modes,
+  unlike `force_tokens`. Set `protect_code=False` to measure what it is worth;
+  expect a weaker compression ratio with it on, since code no longer counts
+  toward the savings.
+- *Negations invert the instruction.* Token pruning drops function words by
+  design, which turns "must never emit `fortios`" into "emit `fortios`" and
+  "No changes to tests" into "changes tests". `DEFAULT_FORCE_TOKENS` pins
+  `not`/`no`/`none`/`never`/`only`/`must`/`cannot`/`without`/`except`/`unless`
+  (and their sentence-initial forms). `.` is deliberately *not* forced —
+  forcing it is what splits `6.4.6` into `6. 4. 6`.
+
+Which further strings are load-bearing is a property of the target MAS's
+prompts, not of FTO, so pass those in from the experiment side — extending
+`DEFAULT_FORCE_TOKENS` rather than replacing it. Anything else
+`compress_prompt` accepts goes through `params`. Compression failures are
+raised, never swallowed: a silent fallback to uncompressed text would make a
+refined restart indistinguishable from an all-context one.
 
 Subclass `ContextCompressor` to plug in another compaction method (an LLM
 summarizer, say) behind the same interface — it takes a list of message texts
@@ -374,6 +395,8 @@ supervisor.start(
 ### Custom fault
 
 Subclass `Fault` and implement `apply(node: NodeAdapter) -> None`.
+
+An injection that never reaches the node raises `FaultInjectionError` rather than being recorded as applied — an injector LLM that hands back the prompt it was given, or an adapter whose `overwrite_last_message` is a no-op for an unrecognised content shape, would otherwise turn a fault run into a baseline run while every log still claimed the fault was injected.
 
 ### Custom node adapter
 

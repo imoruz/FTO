@@ -64,6 +64,10 @@ class Manager:
         if token is not None:
             self.edge_suppressor.restore(token, *args, **kwargs)
 
+    def _reset_edge(self, token, *args, **kwargs):
+        if token is not None:
+            self.edge_suppressor.reset(token, *args, **kwargs)
+
     def make_supervised_callable(self, callable: Callable[..., Any], make_adapter: Callable[..., Any]) -> Callable[..., Any]:
         def wrapped(*args, **kwargs):
             adapter: NodeAdapter = make_adapter(*args, **kwargs)
@@ -89,7 +93,7 @@ class Manager:
         self.logger.info('FTO: Faulty execution completed.', node_id=adapter.id)
 
         if self.restart:
-            result = self._restart(callable, adapter, *args, **kwargs)
+            result = self._restart(callable, adapter, *args, token=token, **kwargs)
         self._restore_edge(token, *args, **kwargs)
         return result
 
@@ -114,7 +118,7 @@ class Manager:
             faults and self.observer.should_restart(faults)
         )
         if self.restart and restartable:
-            result = self._restart(callable, adapter, *args, **kwargs)
+            result = self._restart(callable, adapter, *args, token=token, **kwargs)
 
         self._restore_edge(token, *args, **kwargs)
         return result
@@ -227,12 +231,15 @@ class Manager:
                 idx_step=step,
             )
 
-    def _restart(self, callable, adapter, *args, **kwargs):
+    def _restart(self, callable, adapter, *args, token=None, **kwargs):
         """Re-execute the node, up to ``restart.restart_count`` times for THIS
         node invocation."""
         max_restarts = getattr(self.restart, 'restart_count', 1)
         result = None
         for attempt in range(1, max_restarts + 1):
+            # Only the attempt that runs last may reach the successors, so
+            # drop the edges the previous one produced.
+            self._reset_edge(token, *args, **kwargs)
             if self.checkpoint:
                 self.checkpoint.restore(node_id=adapter.id)
             adapter.set_input(self.restart.get_context())

@@ -2,6 +2,7 @@ import pytest
 
 from fto.recovery import compression
 from fto.recovery.compression import (
+    DEFAULT_FORCE_TOKENS,
     LLMLINGUA2_MODEL,
     LONGLLMLINGUA_MODEL,
     CompressionResult,
@@ -228,3 +229,109 @@ class TestLongLLMLinguaCompression:
 
         _, kwargs = fake_llmlingua.instances[0].calls[0]
         assert kwargs['reorder_context'] == 'original'
+
+
+class TestForceTokenDefaults:
+    def test_the_full_stop_is_not_forced(self):
+        # Forcing '.' makes LLMLingua-2 re-join it as its own word, turning
+        # "6.4.6" into "6. 4. 6" and "cpe.go" into "cpe. go".
+        assert '.' not in DEFAULT_FORCE_TOKENS
+
+    def test_newline_and_colon_are_forced(self):
+        assert '\n' in DEFAULT_FORCE_TOKENS
+        assert ':' in DEFAULT_FORCE_TOKENS
+
+    def test_negations_are_forced_in_both_cases(self):
+        for word in ('not', 'no', 'none', 'never', 'only', 'must'):
+            assert word in DEFAULT_FORCE_TOKENS
+            assert word.capitalize() in DEFAULT_FORCE_TOKENS
+
+    def test_the_compressor_defaults_to_them(self):
+        assert LLMLinguaCompressor().force_tokens == DEFAULT_FORCE_TOKENS
+
+    def test_the_default_list_is_not_shared_between_instances(self):
+        compressor = LLMLinguaCompressor()
+        compressor.force_tokens.append('MINE')
+        assert 'MINE' not in LLMLinguaCompressor().force_tokens
+        assert 'MINE' not in DEFAULT_FORCE_TOKENS
+
+
+class TestCodeSpanProtection:
+    """Pruned code is not shorter, it is wrong.
+
+    `cpe.go` comes back as `cpe.` and "cpe:2.3:h:fortinet" as ":2.:fortinet:",
+    which leaves the restarted node a path or literal that looks real and is
+    not -- so code never reaches the model.
+    """
+
+    def test_a_backtick_span_survives_verbatim(self, fake_llmlingua):
+        result = LLMLinguaCompressor().compress(['edit the file `pkg/cpe/cpe.go` now please'])
+
+        assert '`pkg/cpe/cpe.go`' in result.texts[0]
+
+    def test_a_fenced_block_survives_verbatim(self, fake_llmlingua):
+        fenced = '```go\nreturn util.Unique(cpes)\n```'
+        result = LLMLinguaCompressor().compress([f'apply this edit exactly:\n{fenced}\nthen re-read it'])
+
+        assert fenced in result.texts[0]
+
+    def test_only_the_prose_reaches_the_model(self, fake_llmlingua):
+        LLMLinguaCompressor().compress(['keep the `cpe.go` path and the `6.4.6` version'])
+
+        context, _ = fake_llmlingua.instances[0].calls[0]
+        assert context == ['keep the ', ' path and the ', ' version']
+
+    def test_prose_around_the_code_is_still_compressed(self, fake_llmlingua):
+        result = LLMLinguaCompressor().compress(['one two three four `cpe.go` five six seven eight'])
+
+        # FakePromptCompressor keeps the first half of each fragment's words.
+        assert result.texts[0] == 'one two `cpe.go` five six'
+
+    def test_reassembly_does_not_weld_words_onto_a_code_span(self, fake_llmlingua):
+        # The compressor strips the whitespace around the fragment it was
+        # given, so the separator has to be put back.
+        result = LLMLinguaCompressor().compress(['read `cpe.go` twice'])
+
+        assert result.texts[0] == 'read `cpe.go` twice'
+
+    def test_an_entry_that_is_only_code_is_never_sent(self, fake_llmlingua):
+        result = LLMLinguaCompressor().compress(['`cpe.go`'])
+
+        assert result.texts == ['`cpe.go`']
+        assert fake_llmlingua.instances == []
+
+    def test_several_entries_keep_their_alignment_across_fragments(self, fake_llmlingua):
+        result = LLMLinguaCompressor().compress([
+            'alpha beta gamma delta',
+            'read `a.go` and `b.go` twice over now',
+            'epsilon zeta eta theta',
+        ])
+
+        assert len(result.texts) == 3
+        assert '`a.go`' in result.texts[1] and '`b.go`' in result.texts[1]
+        assert result.texts[0] == 'alpha beta'
+        assert result.texts[2] == 'epsilon zeta'
+
+    def test_protection_applies_to_longllmlingua_too(self, fake_llmlingua):
+        # force_tokens are ignored by the v1 API; span protection is not.
+        compressor = LLMLinguaCompressor(use_llmlingua2=False)
+
+        result = compressor.compress(['keep `cpe.go` intact here'], question='q')
+
+        assert '`cpe.go`' in result.texts[0]
+
+    def test_protection_can_be_turned_off_for_an_ablation(self, fake_llmlingua):
+        compressor = LLMLinguaCompressor(protect_code=False)
+
+        compressor.compress(['keep the `cpe.go` path and the `6.4.6` version'])
+
+        context, _ = fake_llmlingua.instances[0].calls[0]
+        assert context == ['keep the `cpe.go` path and the `6.4.6` version']
+
+    def test_token_counts_cover_the_protected_spans(self, fake_llmlingua):
+        # The reported ratio is the reduction the node actually sees, not the
+        # reduction of the prose the model was shown.
+        result = LLMLinguaCompressor().compress(['one two three four `a.go` five six seven eight'])
+
+        assert result.origin_tokens == 9
+        assert result.compressed_tokens == 5

@@ -3,20 +3,35 @@ import pytest
 from aegis_mas.aegis_core import FMErrorType
 from llmmas_otel.injection import get_engine, is_enabled
 
-from fto.faults import AegisFault, Fault, FaultType, OTelFault, PromptInjectionFault
+from fto.faults import (
+    AegisFault,
+    Fault,
+    FaultInjectionError,
+    FaultType,
+    OTelFault,
+    PromptInjectionFault,
+)
 
 
 class FakeNode:
-    def __init__(self, last_message='hello'):
+    def __init__(self, last_message='hello', id='n1', writes=True):
+        self.id = id
         self.last_message = last_message
         self.appended = []
         self.overwritten = []
+        # writes=False stands in for an adapter whose *_last_message is a
+        # no-op because it doesn't recognise the message content shape.
+        self.writes = writes
 
     def append_to_last_message(self, text):
         self.appended.append(text)
+        if self.writes:
+            self.last_message = f'{self.last_message}\n\n{text}'
 
     def overwrite_last_message(self, text):
         self.overwritten.append(text)
+        if self.writes:
+            self.last_message = text
 
     def to_aegis_context(self):
         return f'ctx-for-{self.last_message}'
@@ -179,3 +194,93 @@ class TestOTelFault:
         fault.disable()
 
         assert is_enabled() is False
+
+
+class TestAegisFaultInjectionIsVerified:
+    """A fault recorded as applied must actually have reached the node.
+
+    An injector that hands back the prompt it was given turns a fault run into
+    a baseline run while every log still says the fault was injected, which
+    silently invalidates whatever that run is compared against.
+    """
+
+    def _fault(self, injected, mode=FMErrorType.FM_2_2, idx_step=4):
+        fault = AegisFault(mode=mode, idx_step=idx_step, node_id='n1')
+        fault.factory.inject_prompt = lambda **kwargs: injected
+        return fault
+
+    def test_unchanged_prompt_raises(self):
+        fault = self._fault(injected='original text')
+        node = FakeNode(last_message='original text')
+
+        with pytest.raises(FaultInjectionError, match='returned the prompt unchanged'):
+            fault.apply(node)
+
+    def test_unchanged_apart_from_surrounding_whitespace_raises(self):
+        fault = self._fault(injected='\n  original text  \n')
+        node = FakeNode(last_message='original text')
+
+        with pytest.raises(FaultInjectionError, match='returned the prompt unchanged'):
+            fault.apply(node)
+
+    def test_empty_injection_raises(self):
+        for injected in ('', '   ', None):
+            fault = self._fault(injected=injected)
+            with pytest.raises(FaultInjectionError, match='returned nothing'):
+                fault.apply(FakeNode(last_message='original text'))
+
+    def test_node_without_a_last_message_raises(self):
+        fault = self._fault(injected='corrupted')
+
+        with pytest.raises(FaultInjectionError, match='has nothing to corrupt'):
+            fault.apply(FakeNode(last_message=None))
+
+    def test_an_adapter_that_silently_does_not_write_raises(self):
+        fault = self._fault(injected='corrupted text')
+        node = FakeNode(last_message='original text', writes=False)
+
+        with pytest.raises(FaultInjectionError, match='left n1 unchanged'):
+            fault.apply(node)
+
+    def test_a_failed_injection_does_not_mark_the_fault_applied(self):
+        fault = self._fault(injected='original text')
+
+        with pytest.raises(FaultInjectionError):
+            fault.apply(FakeNode(last_message='original text'))
+
+        assert fault.applied is False
+
+    def test_the_error_names_the_node_and_the_step(self):
+        fault = self._fault(injected='original text', idx_step=7)
+
+        with pytest.raises(FaultInjectionError) as excinfo:
+            fault.apply(FakeNode(last_message='original text', id='Planner'))
+
+        assert 'Planner' in str(excinfo.value)
+        assert 'idx_step 7' in str(excinfo.value)
+
+    def test_a_real_injection_still_applies(self):
+        fault = self._fault(injected='corrupted text')
+        node = FakeNode(last_message='original text')
+
+        fault.apply(node)
+
+        assert node.overwritten == ['corrupted text']
+        assert fault.applied is True
+
+
+class TestPromptInjectionFaultIsVerified:
+    def test_an_adapter_that_silently_does_not_write_raises(self):
+        fault = PromptInjectionFault(idx_step=1, prompt='hack it')
+        node = FakeNode(writes=False)
+
+        with pytest.raises(FaultInjectionError, match='left n1 unchanged'):
+            fault.apply(node)
+
+    def test_a_failed_injection_does_not_mark_the_fault_applied(self):
+        fault = PromptInjectionFault(idx_step=1, prompt='hack it')
+
+        with pytest.raises(FaultInjectionError):
+            fault.apply(FakeNode(writes=False))
+
+        assert fault.applied is False

@@ -88,3 +88,64 @@ class TestMethodSwapEdgeSuppressor:
         suppressor.restore(token)
 
         assert recorder.calls == []
+
+
+class TestEdgeSuppressorBaseReset:
+    def test_reset_is_a_noop_by_default(self):
+        assert EdgeSuppressor().reset(('token',)) is None
+
+
+class TestMethodSwapEdgeSuppressorReset:
+    def _suppressor(self, recorder):
+        return MethodSwapEdgeSuppressor(lambda *a, **kw: recorder, 'send')
+
+    def test_reset_drops_what_was_captured_so_far(self):
+        recorder = Recorder()
+        suppressor = self._suppressor(recorder)
+
+        token = suppressor.suppress()
+        recorder.send(FakeEdgeLink('target-a'), 'from the faulty attempt', 'node-a')
+        suppressor.reset(token)
+        suppressor.restore(token)
+
+        assert recorder.calls == []
+
+    def test_reset_keeps_suppression_on(self):
+        recorder = Recorder()
+        suppressor = self._suppressor(recorder)
+
+        token = suppressor.suppress()
+        suppressor.reset(token)
+        recorder.send(FakeEdgeLink('target-a'), 'after reset', 'node-a')
+
+        # Still withheld, not passed through to the real method.
+        assert recorder.calls == []
+
+    def test_only_calls_made_after_the_reset_are_replayed(self):
+        recorder = Recorder()
+        suppressor = self._suppressor(recorder)
+
+        token = suppressor.suppress()
+        recorder.send(FakeEdgeLink('exit-node'), 'faulty: we are done', 'planner')
+        suppressor.reset(token)
+        recorder.send(FakeEdgeLink('coder'), 'restarted: here is the plan', 'planner')
+        suppressor.restore(token)
+
+        # Without the reset the faulty "we are done" would reach the exit node
+        # alongside the restarted node's real output.
+        assert [call[1] for call in recorder.calls] == ['restarted: here is the plan']
+
+    def test_reset_clears_the_replay_order_too(self):
+        recorder = Recorder()
+        suppressor = self._suppressor(recorder)
+        link_a, link_b = FakeEdgeLink('target-a'), FakeEdgeLink('target-b')
+
+        token = suppressor.suppress()
+        recorder.send(link_a, 'stale-a', 'node')
+        recorder.send(link_b, 'stale-b', 'node')
+        suppressor.reset(token)
+        recorder.send(link_b, 'fresh-b', 'node')
+        recorder.send(link_a, 'fresh-a', 'node')
+        suppressor.restore(token)
+
+        assert [call[1] for call in recorder.calls] == ['fresh-b', 'fresh-a']
