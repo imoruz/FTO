@@ -1,3 +1,5 @@
+import pytest
+
 from fto.adapters.node.chatdev_node import ChatDevNodeAdapter
 
 
@@ -173,3 +175,162 @@ class TestChatDevNodeAdapter:
         adapter.overwrite_last_message('replaced')
 
         assert inner.input == []
+
+
+class FakeAttachmentBlock:
+    """Non-text block, e.g. an image the task input carried in."""
+
+    def __init__(self, name):
+        self.type = 'image'
+        self.text = None
+        self.name = name
+
+
+class FakeToolMessage(FakeMessage):
+    def __init__(self, content, tool_calls=None, tool_call_id=None):
+        super().__init__(content)
+        self.tool_calls = tool_calls or []
+        self.tool_call_id = tool_call_id
+
+
+class TestChatDevNodeAdapterContextAsList:
+    def test_reads_the_text_of_every_message(self):
+        adapter = ChatDevNodeAdapter(
+            FakeInner('n', [FakeMessage('the plan'), FakeMessage('the report')])
+        )
+        assert adapter.context_as_list() == ['the plan', 'the report']
+
+    def test_reads_a_snapshot_instead_of_the_live_input(self):
+        adapter = ChatDevNodeAdapter(FakeInner('n', [FakeMessage('live')]))
+        snapshot = [FakeMessage('snapshot')]
+
+        assert adapter.context_as_list(snapshot) == ['snapshot']
+
+    def test_joins_the_text_blocks_of_block_list_content(self):
+        adapter = ChatDevNodeAdapter(
+            FakeInner('n', [FakeMessage([FakeBlock('first'), FakeBlock('second')])])
+        )
+        assert adapter.context_as_list() == ['first\n\nsecond']
+
+    def test_attachment_blocks_contribute_no_text(self):
+        content = [FakeAttachmentBlock('diagram.png'), FakeBlock('the issue')]
+        adapter = ChatDevNodeAdapter(FakeInner('n', [FakeMessage(content)]))
+
+        assert adapter.context_as_list() == ['the issue']
+
+    def test_a_message_with_no_text_at_all_reports_an_empty_entry(self):
+        adapter = ChatDevNodeAdapter(
+            FakeInner('n', [FakeMessage([FakeAttachmentBlock('a.png')]), FakeMessage(12345)])
+        )
+        assert adapter.context_as_list() == ['', '']
+
+    def test_tool_protocol_messages_report_an_empty_entry(self):
+        # Rewriting either half of a call/result pair would break the pairing.
+        messages = [
+            FakeToolMessage('calling a tool', tool_calls=[{'id': '1'}]),
+            FakeToolMessage('the tool result', tool_call_id='1'),
+        ]
+        adapter = ChatDevNodeAdapter(FakeInner('n', messages))
+
+        assert adapter.context_as_list() == ['', '']
+
+    def test_an_empty_context_reads_as_an_empty_list(self):
+        assert ChatDevNodeAdapter(FakeInner('n', [])).context_as_list() == []
+        assert ChatDevNodeAdapter(FakeInner('n', None)).context_as_list() == []
+
+
+class TestChatDevNodeAdapterContextFromList:
+    def test_replaces_string_content_message_by_message(self):
+        messages = [FakeMessage('the plan'), FakeMessage('the report')]
+        adapter = ChatDevNodeAdapter(FakeInner('n', messages))
+
+        rebuilt = adapter.context_from_list(['compressed plan', 'compressed report'])
+
+        assert [m.content for m in rebuilt] == ['compressed plan', 'compressed report']
+
+    def test_an_empty_entry_keeps_that_message_exactly_as_it_was(self):
+        kept = FakeMessage('the review')
+        adapter = ChatDevNodeAdapter(FakeInner('n', [FakeMessage('the plan'), kept]))
+
+        rebuilt = adapter.context_from_list(['compressed plan', ''])
+
+        assert rebuilt[0].content == 'compressed plan'
+        assert rebuilt[1] is kept
+
+    def test_it_does_not_touch_the_context_it_was_given(self):
+        messages = [FakeMessage('the plan')]
+        adapter = ChatDevNodeAdapter(FakeInner('n', messages))
+
+        rebuilt = adapter.context_from_list(['compressed plan'])
+
+        assert messages[0].content == 'the plan'
+        assert rebuilt[0] is not messages[0]
+
+    def test_rebuilds_a_snapshot_instead_of_the_live_input(self):
+        adapter = ChatDevNodeAdapter(FakeInner('n', [FakeMessage('live')]))
+        snapshot = [FakeMessage('snapshot')]
+
+        rebuilt = adapter.context_from_list(['compressed'], snapshot)
+
+        assert [m.content for m in rebuilt] == ['compressed']
+
+    def test_block_list_content_keeps_its_block_shape(self, fake_module):
+        MessageBlock = _stub_message_block(fake_module)
+        adapter = ChatDevNodeAdapter(
+            FakeInner('n', [FakeMessage([MessageBlock('a'), MessageBlock('b')])])
+        )
+
+        rebuilt = adapter.context_from_list(['compressed'])
+
+        content = rebuilt[0].content
+        assert len(content) == 1
+        assert isinstance(content[0], MessageBlock)
+        assert content[0].text == 'compressed'
+
+    def test_dict_block_content_keeps_its_dict_shape(self):
+        adapter = ChatDevNodeAdapter(
+            FakeInner('n', [FakeMessage([{'type': 'text', 'text': 'a'}])])
+        )
+
+        rebuilt = adapter.context_from_list(['compressed'])
+
+        assert rebuilt[0].content == [{'type': 'text', 'text': 'compressed'}]
+
+    def test_attachments_keep_their_place_around_the_new_text(self, fake_module):
+        MessageBlock = _stub_message_block(fake_module)
+        attachment = FakeAttachmentBlock('diagram.png')
+        content = [attachment, MessageBlock('the issue'), MessageBlock('more')]
+        adapter = ChatDevNodeAdapter(FakeInner('n', [FakeMessage(content)]))
+
+        rebuilt = adapter.context_from_list(['compressed issue'])
+
+        new_content = rebuilt[0].content
+        assert new_content[0] is attachment
+        assert len(new_content) == 2
+        assert new_content[1].text == 'compressed issue'
+
+    def test_a_message_with_no_text_to_replace_is_left_alone(self):
+        message = FakeMessage([FakeAttachmentBlock('a.png')])
+        adapter = ChatDevNodeAdapter(FakeInner('n', [message]))
+
+        rebuilt = adapter.context_from_list(['compressed'])
+
+        assert rebuilt[0] is message
+
+    def test_content_of_an_unknown_shape_is_left_alone(self):
+        message = FakeMessage(12345)
+        adapter = ChatDevNodeAdapter(FakeInner('n', [message]))
+
+        assert adapter.context_from_list(['compressed'])[0] is message
+
+    def test_a_mismatched_number_of_entries_is_an_error(self):
+        adapter = ChatDevNodeAdapter(
+            FakeInner('n', [FakeMessage('a'), FakeMessage('b')])
+        )
+
+        with pytest.raises(ValueError, match='line up one to one'):
+            adapter.context_from_list(['only one'])
+
+    def test_an_empty_context_rebuilds_to_an_empty_list(self):
+        assert ChatDevNodeAdapter(FakeInner('n', [])).context_from_list([]) == []
+        assert ChatDevNodeAdapter(FakeInner('n', None)).context_from_list([]) == []

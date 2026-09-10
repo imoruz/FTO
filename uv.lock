@@ -392,6 +392,7 @@ dependencies = [
     { name = "llmlingua" },
     { name = "llmmas-otel" },
     { name = "ollama" },
+    { name = "pytest" },
     { name = "ruff" },
 ]
 
@@ -408,6 +409,7 @@ requires-dist = [
     { name = "llmlingua", specifier = ">=0.2.2" },
     { name = "llmmas-otel", git = "https://github.com/vagabondboffin/llmmas-otel.git" },
     { name = "ollama", specifier = ">=0.6.1" },
+    { name = "pytest", specifier = ">=9.1.1" },
     { name = "ruff", specifier = ">=0.15.12" },
 ]
 

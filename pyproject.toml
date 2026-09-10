@@ -12,6 +12,7 @@ dependencies = [
     "llmlingua>=0.2.2",
     "llmmas-otel",
     "ollama>=0.6.1",
+    "pytest>=9.1.1",
     "ruff>=0.15.12",
 ]
 

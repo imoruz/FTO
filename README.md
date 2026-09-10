@@ -132,11 +132,67 @@ fault = OTelFault(
 Control what context is passed to the restarted node.
 
 ```python
-from fto.recovery import RestartAllContext, RestartNoContext
+from fto.recovery import RestartAllContext, RestartNoContext, RestartRefinedContext
 
-restart = RestartAllContext()   # re-run with full original input
-restart = RestartNoContext()    # re-run with no context
+restart = RestartAllContext()      # re-run with full original input
+restart = RestartNoContext()       # re-run with no context
+restart = RestartRefinedContext()  # re-run with the history compressed
 ```
+
+Whichever strategy is configured, the context handed back is the snapshot taken
+*before* the fault was injected, never whatever the fault left in the node's
+input.
+
+### Refined context
+
+`RestartRefinedContext` compresses every message the node had queued except the
+last `keep_last` (default 1). Those last ones are what the node is being asked
+to act on right now, so they go back in verbatim. In a planner/coder loop, a
+coder restarted mid-implementation comes back to a compressed plan and a
+compressed copy of its own earlier report, but to the review it has to answer
+in full.
+
+Compression rewrites only the text inside a message: roles, sources, keep
+flags and attachments are preserved, and tool-call messages are passed through
+untouched so their pairing stays intact. That is what keeps the refined
+context a valid input for the same node.
+
+```python
+from fto.recovery import LLMLinguaCompressor, RestartRefinedContext
+
+restart = RestartRefinedContext(
+    restart_count=2,
+    keep_last=1,
+    compressor=LLMLinguaCompressor(
+        rate=0.55,                            # fraction of tokens to keep
+        force_tokens=['\n', '.', ':', 'TASK_COMPLETE'],  # never dropped
+    ),
+    logger=logger,                            # logs the compression ratio
+)
+```
+
+Compression is [LLMLingua](https://github.com/microsoft/LLMLingua) token
+pruning. `LLMLinguaCompressor` defaults to LLMLingua-2 (a small token
+classifier, one batched pass over the history, honours `force_tokens`); set
+`use_llmlingua2=False` for LongLLMLingua, which compresses each message
+conditioned on the kept-verbatim one but needs a 7B causal model and ignores
+`force_tokens`. The model loads lazily on first use and is then reused, and
+each snapshot is compressed once however many restart attempts follow.
+
+Which strings are load-bearing enough to force-keep is a property of the
+target MAS's prompts, not of FTO, so pass them in from the experiment side.
+Anything else `compress_prompt` accepts goes through `params`. Compression
+failures are raised, never swallowed: a silent fallback to uncompressed text
+would make a refined restart indistinguishable from an all-context one.
+
+Subclass `ContextCompressor` to plug in another compaction method (an LLM
+summarizer, say) behind the same interface — it takes a list of message texts
+plus the question they lead up to, and returns one compressed entry per input
+entry.
+
+The message ↔ text translation belongs to the node adapters
+(`context_as_list` / `context_from_list`), so nothing in the recovery layer
+knows which framework produced the messages.
 
 ---
 
@@ -323,6 +379,8 @@ Subclass `Fault` and implement `apply(node: NodeAdapter) -> None`.
 
 Subclass `NodeAdapter` and implement `id`, `input`, `last_message`, `is_agent`, `set_input`, `append_to_last_message`, `overwrite_last_message`, and `to_aegis_context`.
 
+For [refined-context restarts](#refined-context) also implement `context_as_list` (the node context as plain text, one entry per message, `''` where there is nothing a compressor may rewrite) and `context_from_list` (the same context rebuilt with each message's text replaced, `''` leaving that message untouched). The `content_text` and `replace_content_text` helpers in `fto.adapters.node.node` cover the usual string / block-list content shapes.
+
 ### Custom checkpoint
 
 Subclass `Checkpoint` and implement `save_baseline`, `save`, and `restore`.
@@ -331,4 +389,4 @@ Subclass `Checkpoint` and implement `save_baseline`, `save`, and `restore`.
 
 ## Project Status
 
-Early-stage library (v0.1.0). The `RestartRefinedContext` mode and some checkpoint strategies are placeholders pending further development.
+Early-stage library (v0.1.0). Some checkpoint strategies are placeholders pending further development.

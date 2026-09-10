@@ -1,3 +1,5 @@
+import pytest
+
 from fto.adapters.node.langgraph_node import LangGraphNodeAdapter
 
 
@@ -131,3 +133,103 @@ class TestLangGraphNodeAdapter:
         adapter.overwrite_last_message('replaced')
 
         assert task.input.messages == []
+
+
+class FakeToolMessage(FakeMessage):
+    def __init__(self, content, tool_calls=None, tool_call_id=None):
+        super().__init__(content)
+        self.tool_calls = tool_calls or []
+        self.tool_call_id = tool_call_id
+
+
+class TestLangGraphNodeAdapterContextAsList:
+    def test_reads_the_text_of_every_message(self):
+        task = FakeTask('n', [FakeMessage('the plan'), FakeMessage('the report')])
+        adapter = LangGraphNodeAdapter(task, NODE_SPEC)
+
+        assert adapter.context_as_list() == ['the plan', 'the report']
+
+    def test_reads_a_snapshot_instead_of_the_live_input(self):
+        adapter = LangGraphNodeAdapter(FakeTask('n', [FakeMessage('live')]), NODE_SPEC)
+
+        assert adapter.context_as_list([FakeMessage('snapshot')]) == ['snapshot']
+
+    def test_joins_the_text_blocks_of_block_list_content(self):
+        content = [{'type': 'text', 'text': 'first'}, {'type': 'text', 'text': 'second'}]
+        adapter = LangGraphNodeAdapter(FakeTask('n', [FakeMessage(content)]), NODE_SPEC)
+
+        assert adapter.context_as_list() == ['first\n\nsecond']
+
+    def test_non_text_blocks_contribute_no_text(self):
+        content = [{'type': 'image_url', 'image_url': 'http://x/y.png'},
+                   {'type': 'text', 'text': 'the issue'}]
+        adapter = LangGraphNodeAdapter(FakeTask('n', [FakeMessage(content)]), NODE_SPEC)
+
+        assert adapter.context_as_list() == ['the issue']
+
+    def test_tool_protocol_messages_report_an_empty_entry(self):
+        messages = [
+            FakeToolMessage('calling a tool', tool_calls=[{'id': '1'}]),
+            FakeToolMessage('the tool result', tool_call_id='1'),
+        ]
+        adapter = LangGraphNodeAdapter(FakeTask('n', messages), NODE_SPEC)
+
+        assert adapter.context_as_list() == ['', '']
+
+    def test_an_empty_context_reads_as_an_empty_list(self):
+        adapter = LangGraphNodeAdapter(FakeTask('n', []), NODE_SPEC)
+        assert adapter.context_as_list() == []
+
+
+class TestLangGraphNodeAdapterContextFromList:
+    def test_replaces_string_content_message_by_message(self):
+        task = FakeTask('n', [FakeMessage('the plan'), FakeMessage('the report')])
+        adapter = LangGraphNodeAdapter(task, NODE_SPEC)
+
+        rebuilt = adapter.context_from_list(['compressed plan', 'compressed report'])
+
+        assert [m.content for m in rebuilt] == ['compressed plan', 'compressed report']
+
+    def test_an_empty_entry_keeps_that_message_exactly_as_it_was(self):
+        kept = FakeMessage('the review')
+        task = FakeTask('n', [FakeMessage('the plan'), kept])
+        adapter = LangGraphNodeAdapter(task, NODE_SPEC)
+
+        rebuilt = adapter.context_from_list(['compressed plan', ''])
+
+        assert rebuilt[0].content == 'compressed plan'
+        assert rebuilt[1] is kept
+
+    def test_it_does_not_touch_the_context_it_was_given(self):
+        messages = [FakeMessage('the plan')]
+        adapter = LangGraphNodeAdapter(FakeTask('n', messages), NODE_SPEC)
+
+        rebuilt = adapter.context_from_list(['compressed plan'])
+
+        assert messages[0].content == 'the plan'
+        assert rebuilt[0] is not messages[0]
+
+    def test_block_list_content_keeps_its_block_shape(self):
+        content = [{'type': 'image_url', 'image_url': 'http://x/y.png'},
+                   {'type': 'text', 'text': 'the issue'}]
+        adapter = LangGraphNodeAdapter(FakeTask('n', [FakeMessage(content)]), NODE_SPEC)
+
+        rebuilt = adapter.context_from_list(['compressed issue'])
+
+        assert rebuilt[0].content == [
+            {'type': 'image_url', 'image_url': 'http://x/y.png'},
+            {'type': 'text', 'text': 'compressed issue'},
+        ]
+
+    def test_a_message_with_no_text_to_replace_is_left_alone(self):
+        message = FakeMessage([{'type': 'image_url', 'image_url': 'http://x/y.png'}])
+        adapter = LangGraphNodeAdapter(FakeTask('n', [message]), NODE_SPEC)
+
+        assert adapter.context_from_list(['compressed'])[0] is message
+
+    def test_a_mismatched_number_of_entries_is_an_error(self):
+        task = FakeTask('n', [FakeMessage('a'), FakeMessage('b')])
+        adapter = LangGraphNodeAdapter(task, NODE_SPEC)
+
+        with pytest.raises(ValueError, match='line up one to one'):
+            adapter.context_from_list(['only one'])

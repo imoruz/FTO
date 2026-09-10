@@ -32,7 +32,7 @@ class Manager:
         if self.checkpoint:
             self.checkpoint.save(node_id=adapter.id)
         if self.restart:
-            self.restart.set_context(adapter.input)
+            self.restart.set_context(adapter.input, adapter=adapter)
 
     def apply_fault(self, adapter: NodeAdapter):
         self.fault.apply(node=adapter)
@@ -138,7 +138,7 @@ class Manager:
             if self.checkpoint:
                 self.checkpoint.save(node_id=adapter.id)
             if self.restart:
-                self.restart.set_context(adapter.input)
+                self.restart.set_context(adapter.input, adapter=adapter)
 
             if not self.fault.applied and self.fault.idx_step == self.idx_step:
                 self.fault.apply(node=adapter)

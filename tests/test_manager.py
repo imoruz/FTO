@@ -4,7 +4,8 @@ from fto.detection.atp import status
 from fto.detection.detection import Detection
 from fto.instrumentation import take_detections, take_injection
 from fto.manager import Manager
-from fto.recovery.restart import Restart
+from fto.recovery.compression import CompressionResult, ContextCompressor
+from fto.recovery.restart import Restart, RestartRefinedContext
 
 
 @pytest.fixture(autouse=True)
@@ -161,6 +162,16 @@ class TestSnapshot:
 
         assert checkpoint.saved == ['n1']
         assert restart.context == 'the-input'
+
+    def test_hands_the_adapter_to_the_restart_alongside_the_context(self):
+        # Refined-context restart reads and rebuilds the context through it.
+        restart = FakeRestart()
+        manager = make_manager(restart=restart)
+        adapter = FakeAdapter(id='n1', input='the-input')
+
+        manager.snapshot(adapter)
+
+        assert restart.adapter is adapter
 
     def test_noop_when_neither_checkpoint_nor_restart_configured(self):
         manager = make_manager()
@@ -577,3 +588,87 @@ class TestRestart:
 
         # attempt == max_restarts (1 == 1) -> allow_eager False -> can_restart False
         assert observer.begin_scope_calls[0][3] is False
+
+
+class MessageAdapter(FakeAdapter):
+    """FakeAdapter that also speaks the context <-> text protocol.
+
+    Messages are `(role, text)` pairs, which is all a refined restart needs to
+    show that roles survive compression.
+    """
+
+    def context_as_list(self, context=None):
+        messages = self.input if context is None else context
+        return [text for _, text in messages]
+
+    def context_from_list(self, texts, context=None):
+        messages = self.input if context is None else context
+        return [
+            (role, text or original)
+            for (role, original), text in zip(messages, texts)
+        ]
+
+
+class HalvingCompressor(ContextCompressor):
+    """Deterministic stand-in for LLMLingua: keeps the first half of the words."""
+
+    def compress(self, contexts, question=''):
+        self.question = question
+        texts = [' '.join(c.split()[: max(1, len(c.split()) // 2)]) for c in contexts]
+        return CompressionResult(texts, origin_tokens=10, compressed_tokens=5)
+
+
+class TestRestartWithRefinedContext:
+    """The refined-context strategy driven through the real manager flow."""
+
+    def make(self, messages, restart_count=1):
+        compressor = HalvingCompressor()
+        restart = RestartRefinedContext(
+            restart_count=restart_count, compressor=compressor
+        )
+        manager = make_manager(restart=restart)
+        adapter = MessageAdapter(id='Coder', input=messages)
+        return manager, restart, adapter, compressor
+
+    def test_the_node_restarts_on_compressed_history_and_a_verbatim_last_message(self):
+        messages = [
+            ('user', 'the plan says do this and that'),
+            ('assistant', 'the report says it is done'),
+            ('user', 'the review says fix one more thing'),
+        ]
+        manager, _, adapter, _ = self.make(messages)
+
+        manager.snapshot(adapter)
+        manager._restart(lambda: 'ok', adapter)
+
+        assert adapter.set_input_calls == [
+            [
+                ('user', 'the plan says'),
+                ('assistant', 'the report says'),
+                ('user', 'the review says fix one more thing'),
+            ]
+        ]
+
+    def test_compression_is_conditioned_on_the_message_kept_verbatim(self):
+        messages = [('user', 'the plan'), ('user', 'the review')]
+        manager, _, adapter, compressor = self.make(messages)
+
+        manager.snapshot(adapter)
+        manager._restart(lambda: 'ok', adapter)
+
+        assert compressor.question == 'the review'
+
+    def test_the_snapshot_survives_the_fault_mangling_the_node_input(self):
+        messages = [('user', 'the plan says do this'), ('user', 'the review')]
+        manager, _, adapter, _ = self.make(messages)
+
+        manager.snapshot(adapter)
+        # What an injected fault does to the node before it runs.
+        adapter.set_input([('user', 'CORRUPTED'), ('user', 'CORRUPTED')])
+        adapter.set_input_calls.clear()
+
+        manager._restart(lambda: 'ok', adapter)
+
+        assert adapter.set_input_calls == [
+            [('user', 'the plan'), ('user', 'the review')]
+        ]
