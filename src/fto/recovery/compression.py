@@ -13,6 +13,7 @@ from, which is what lets roles, sources and attachments survive compression.
 
 import re
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Dict, List
 
 # LLMLingua-2: a BERT-size token classifier, task-agnostic and cheap to run.
@@ -82,6 +83,24 @@ class CompressionResult:
         )
 
 
+class CompressionFailure(StrEnum):
+    """What a restart does when compression raises.
+
+    There is no safe default guess: silently falling back to uncompressed text
+    makes a refined restart indistinguishable from an all-context one, and a
+    benchmark that mixes the two without saying so is unreadable. So the
+    choice is explicit, and either way the restart records whether the turn
+    was actually compressed.
+    """
+
+    #: Let the error out and fail the run. Nothing is recorded as refined
+    #: that was not refined.
+    RAISE = 'raise'
+    #: Fall back to the no-op passthrough, log it as a warning, and mark the
+    #: turn uncompressed so it can be filtered out of the results.
+    PASSTHROUGH = 'passthrough'
+
+
 class ContextCompressor:
     """Shrinks context entries, one compressed entry per input entry.
 
@@ -89,12 +108,17 @@ class ContextCompressor:
     whenever compression should be disabled without changing the restart mode.
     """
 
+    #: Whether ``compress`` actually reads ``question``. Callers check this
+    #: instead of passing a question that will be silently discarded.
+    uses_question: bool = False
+
     def compress(self, contexts: List[str], question: str = '') -> CompressionResult:
         """Compress ``contexts``, optionally conditioned on ``question``.
 
-        ``question`` is what the node is about to act on (the messages the
-        restart keeps verbatim). Compressors that support query-aware
-        compression use it to decide what in the history still matters.
+        ``question`` is what the node is about to act on -- the messages the
+        restart keeps verbatim. Only a query-aware compressor uses it, and
+        only those set ``uses_question``; for everything else it is ignored,
+        so do not read a conditioning guarantee into the signature.
         """
         texts = list(contexts)
         return CompressionResult(texts)
@@ -163,10 +187,24 @@ class LLMLinguaCompressor(ContextCompressor):
     filtering is switched off because it drops whole entries, which would break
     that alignment. This mode honours ``force_tokens``.
 
+    LLMLingua-2 is **task-agnostic and ignores ``question``** -- upstream,
+    ``compress_prompt`` forwards neither ``question`` nor ``instruction`` to
+    ``compress_prompt_llmlingua2``, and the paper frames the method as uniform
+    relevance scoring with no awareness of what the node is about to do. So
+    ``uses_question`` is False in this mode and the restart layer does not
+    build a question for it. Do not "fix" that by passing one: it would imply
+    a conditioning that is not happening. What keeps the history faithful here
+    is ``force_tokens``, ``PROTECTED_SPANS`` and ``min_fragment_chars``, not
+    relevance to the active message -- so the rate needs needle-testing rather
+    than trusting the scorer to know what matters (see tests/recovery/
+    test_needle.py; on Planner/Coder plans rate 0.4 held every needle and
+    0.25 began shortening line ranges).
+
     ``use_llmlingua2=False`` runs LongLLMLingua once per entry, conditioned on
     ``question``: the v1 API only ever returns one flat string, so per-entry
-    calls are what keeps entries separable. ``force_tokens`` is not supported
-    upstream in this mode and is ignored.
+    calls are what keeps entries separable. This is the only mode where
+    ``uses_question`` is True. ``force_tokens`` is not supported upstream
+    here and is ignored.
 
     With ``protect_code`` (the default) only prose reaches the model: fenced
     code blocks and inline backtick spans are cut out, held aside, and put
@@ -193,6 +231,11 @@ class LLMLinguaCompressor(ContextCompressor):
     # Keep fenced code blocks and backtick spans out of the compressor.
     # Turn it off only to measure what protection is worth.
     protect_code: bool = True
+    # Prose runs shorter than this are kept verbatim. Protecting code splits a
+    # message into many short fragments -- in a plan dense with backticks most
+    # of them are a few words of glue -- and each one costs its own padded
+    # forward pass while saving almost nothing. 0 compresses every fragment.
+    min_fragment_chars: int = 80
     # Escape hatch for anything else ``compress_prompt`` accepts.
     params: Dict[str, Any] = field(default_factory=dict)
 
@@ -202,18 +245,24 @@ class LLMLinguaCompressor(ContextCompressor):
                 LLMLINGUA2_MODEL if self.use_llmlingua2 else LONGLLMLINGUA_MODEL
             )
 
+    @property
+    def uses_question(self) -> bool:
+        """Only LongLLMLingua conditions on the question; LLMLingua-2 ignores it."""
+        return not self.use_llmlingua2
+
     def compress(self, contexts: List[str], question: str = '') -> CompressionResult:
         entries = [text if isinstance(text, str) else '' for text in contexts]
         plans = [self._plan(text) for text in entries]
 
-        # Every prose fragment across every entry, in order. Entries with
-        # nothing to compress (empty, attachment-only, tool protocol, or
-        # nothing but code) contribute none and are never shown to the model.
+        # Every prose fragment worth compressing, across every entry, in
+        # order. Entries with nothing to compress (empty, attachment-only,
+        # tool protocol, or nothing but code) contribute none and are never
+        # shown to the model.
         todo = [
             (i, j)
             for i, plan in enumerate(plans)
             for j, (compressible, fragment) in enumerate(plan)
-            if compressible and fragment.strip()
+            if compressible and len(fragment.strip()) >= max(1, self.min_fragment_chars)
         ]
         if not todo:
             return CompressionResult(entries)
@@ -255,6 +304,8 @@ class LLMLinguaCompressor(ContextCompressor):
         return pieces
 
     def _compress_batch(self, contexts: List[str]) -> List[str]:
+        # No question here on purpose: compress_prompt drops it before
+        # reaching compress_prompt_llmlingua2 (see the class docstring).
         result = self._compressor().compress_prompt(
             contexts,
             rate=self.rate,

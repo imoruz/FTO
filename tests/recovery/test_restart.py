@@ -49,12 +49,17 @@ class FakeAdapter:
 
 
 class FakeCompressor(ContextCompressor):
-    def __init__(self, texts=None):
+    def __init__(self, texts=None, uses_question=False, raises=None):
         self.calls = []
         self._texts = texts
+        self.uses_question = uses_question
+        self._raises = raises
+
 
     def compress(self, contexts, question=''):
         self.calls.append((list(contexts), question))
+        if self._raises is not None:
+            raise self._raises
         texts = self._texts if self._texts is not None else [f'<{c}>' for c in contexts]
         return CompressionResult(list(texts), origin_tokens=100, compressed_tokens=40)
 
@@ -164,8 +169,8 @@ class TestRestartRefinedContext:
             ('user', 'the report'),
         )
 
-    def test_conditions_compression_on_the_message_kept_verbatim(self):
-        compressor = FakeCompressor()
+    def test_a_query_aware_compressor_is_given_the_message_kept_verbatim(self):
+        compressor = FakeCompressor(uses_question=True)
         restart = RestartRefinedContext(compressor=compressor)
         restart.set_context(
             make_context(('user', 'the plan'), ('user', 'the review')),
@@ -175,6 +180,20 @@ class TestRestartRefinedContext:
         restart.get_context()
 
         assert compressor.calls == [(['the plan'], 'the review')]
+
+    def test_no_question_is_built_for_a_compressor_that_ignores_it(self):
+        # LLMLingua-2 is task-agnostic and discards the question; handing it
+        # one would imply a conditioning that does not happen.
+        compressor = FakeCompressor(uses_question=False)
+        restart = RestartRefinedContext(compressor=compressor)
+        restart.set_context(
+            make_context(('user', 'the plan'), ('user', 'the review')),
+            adapter=FakeAdapter(),
+        )
+
+        restart.get_context()
+
+        assert compressor.calls == [(['the plan'], '')]
 
     def test_keep_last_can_hold_back_more_than_one_message(self):
         restart = RestartRefinedContext(compressor=FakeCompressor(), keep_last=2)
@@ -266,8 +285,24 @@ class TestRestartRefinedContext:
         assert logger.messages == [
             'Refined context: compressed 2 of 3 message(s), '
             '100 -> 40 tokens (40.0% of original); '
-            'last 1 message(s) kept verbatim.'
+            'last 1 message(s) kept verbatim; question-conditioned: False.'
         ]
+
+    def test_the_log_counts_only_messages_that_held_text(self):
+        # Empty messages are never sent to the compressor; counting them as
+        # compressed is what made "compressed 6 of 7" misleading in a run
+        # where only two messages had any text.
+        logger = RecordingLogger()
+        restart = RestartRefinedContext(compressor=FakeCompressor(), logger=logger)
+        restart.set_context(
+            make_context(('user', 'a'), ('assistant', ''), ('assistant', ''),
+                         ('user', 'b'), ('user', 'c')),
+            adapter=FakeAdapter(),
+        )
+
+        restart.get_context()
+
+        assert logger.messages[0].startswith('Refined context: compressed 2 of 5 message(s)')
 
     def test_it_works_without_a_logger(self):
         restart = RestartRefinedContext(compressor=FakeCompressor())
@@ -322,6 +357,97 @@ class TestRestartRefinedContext:
         restart.get_context()
 
         assert compressor.calls == [
-            (['first plan'], 'first review'),
-            (['second plan'], 'second review'),
+            (['first plan'], ''),
+            (['second plan'], ''),
         ]
+
+
+class TestRestartRefinedContextFailurePolicy:
+    """A benchmark must never contain an invisible mix of refined and not."""
+
+    def _restart(self, **kwargs):
+        restart = RestartRefinedContext(**kwargs)
+        restart.set_context(
+            make_context(('user', 'the plan'), ('user', 'the review')),
+            adapter=FakeAdapter(),
+        )
+        return restart
+
+    def test_it_raises_by_default(self):
+        restart = self._restart(compressor=FakeCompressor(raises=RuntimeError('boom')))
+
+        with pytest.raises(RuntimeError, match='boom'):
+            restart.get_context()
+
+    def test_passthrough_returns_the_uncompressed_history(self):
+        restart = self._restart(
+            compressor=FakeCompressor(raises=RuntimeError('boom')),
+            on_error='passthrough',
+        )
+
+        assert restart.get_context() == make_context(
+            ('user', 'the plan'), ('user', 'the review')
+        )
+
+    def test_passthrough_marks_the_turn_uncompressed_and_says_why(self):
+        restart = self._restart(
+            compressor=FakeCompressor(raises=RuntimeError('boom')),
+            on_error='passthrough',
+        )
+
+        restart.get_context()
+
+        assert restart.compressed is False
+        assert restart.failure == 'RuntimeError: boom'
+
+    def test_passthrough_logs_a_warning_naming_the_consequence(self):
+        logger = RecordingLogger()
+        restart = self._restart(
+            compressor=FakeCompressor(raises=RuntimeError('boom')),
+            on_error='passthrough',
+            logger=logger,
+        )
+
+        restart.get_context()
+
+        assert 'NOT refined' in logger.messages[0]
+        assert 'boom' in logger.messages[0]
+
+    def test_a_raise_still_records_the_failure_before_propagating(self):
+        restart = self._restart(compressor=FakeCompressor(raises=ValueError('nope')))
+
+        with pytest.raises(ValueError):
+            restart.get_context()
+
+        assert restart.compressed is False
+        assert restart.failure == 'ValueError: nope'
+
+    def test_a_successful_compression_marks_the_turn_compressed(self):
+        restart = self._restart(compressor=FakeCompressor())
+
+        restart.get_context()
+
+        assert restart.compressed is True
+        assert restart.failure is None
+
+    def test_metadata_starts_unset_and_resets_with_each_snapshot(self):
+        restart = self._restart(compressor=FakeCompressor())
+        restart.get_context()
+
+        restart.set_context(make_context(('user', 'a')), adapter=FakeAdapter())
+
+        assert restart.compressed is None
+        assert restart.failure is None
+
+    def test_a_history_of_only_kept_messages_is_recorded_as_uncompressed(self):
+        restart = RestartRefinedContext(compressor=FakeCompressor())
+        restart.set_context(make_context(('user', 'only this')), adapter=FakeAdapter())
+
+        restart.get_context()
+
+        assert restart.compressed is False
+        assert 'nothing to compress' in restart.failure
+
+    def test_an_unknown_policy_is_rejected_at_construction(self):
+        with pytest.raises(ValueError):
+            RestartRefinedContext(on_error='carry-on-regardless')

@@ -617,8 +617,13 @@ class MessageAdapter(FakeAdapter):
 class HalvingCompressor(ContextCompressor):
     """Deterministic stand-in for LLMLingua: keeps the first half of the words."""
 
+    def __init__(self):
+        self.question = None
+        self.seen = []
+
     def compress(self, contexts, question=''):
         self.question = question
+        self.seen.append(list(contexts))
         texts = [' '.join(c.split()[: max(1, len(c.split()) // 2)]) for c in contexts]
         return CompressionResult(texts, origin_tokens=10, compressed_tokens=5)
 
@@ -654,14 +659,17 @@ class TestRestartWithRefinedContext:
             ]
         ]
 
-    def test_compression_is_conditioned_on_the_message_kept_verbatim(self):
+    def test_only_the_history_reaches_the_compressor(self):
+        # The active/history split is the restart layer's job: the message the
+        # node has to act on must never be handed to the compressor.
         messages = [('user', 'the plan'), ('user', 'the review')]
         manager, _, adapter, compressor = self.make(messages)
 
         manager.snapshot(adapter)
         manager._restart(lambda: 'ok', adapter)
 
-        assert compressor.question == 'the review'
+        assert compressor.seen == [['the plan']]
+        assert compressor.question == ''
 
     def test_the_snapshot_survives_the_fault_mangling_the_node_input(self):
         messages = [('user', 'the plan says do this'), ('user', 'the review')]

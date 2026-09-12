@@ -145,6 +145,9 @@ input.
 
 ### Refined context
 
+> Full walkthrough of the compression mechanism — what it protects and why,
+> what it costs, how to pick a rate, and the gotchas: **[docs/compression.md](docs/compression.md)**.
+
 `RestartRefinedContext` compresses every message the node had queued except the
 last `keep_last` (default 1). Those last ones are what the node is being asked
 to act on right now, so they go back in verbatim. In a planner/coder loop, a
@@ -178,7 +181,32 @@ classifier, one batched pass over the history, honours `force_tokens`); set
 `use_llmlingua2=False` for LongLLMLingua, which compresses each message
 conditioned on the kept-verbatim one but needs a 7B causal model and ignores
 `force_tokens`. The model loads lazily on first use and is then reused, and
-each snapshot is compressed once however many restart attempts follow.
+each snapshot is compressed once however many restart attempts follow — later
+attempts replay the same refined text rather than paying for the model again.
+
+**LLMLingua-2 is task-agnostic: it ignores `question`.** Upstream,
+`compress_prompt` forwards neither `question` nor `instruction` to
+`compress_prompt_llmlingua2`, and the paper frames the method as uniform
+relevance scoring with no awareness of what the node is about to do. A
+compressor advertises this through `uses_question`, and the restart layer only
+builds a question when that is True — so nothing implies a conditioning that
+is not happening, and the log line records which it was. Don't "fix" it by
+passing a question in LLMLingua-2 mode.
+
+The practical consequence: there is no relevance-awareness safety net, so the
+rate has to be **needle-tested** rather than trusted. `tests/recovery/`
+`test_needle.py` is that gate — it plants a file path, a line range, a
+negation and a version string in a history entry, compresses, and checks they
+came back. It loads the real ~2GB model, so it is opt-in:
+
+```bash
+FTO_NEEDLE_TEST=1 pytest tests/recovery/test_needle.py -v
+```
+
+On Planner/Coder plans, rate 0.55 and 0.4 held every needle; 0.25 began
+shortening line ranges (`lines 87-104` → `87`). Note the guarantee is by
+backtick, not by looking like code — a literal written as bare prose is scored
+like any other words, so quote it or name it in `force_tokens`.
 
 **Two ways token pruning goes wrong on agent context**, both guarded by
 default:
@@ -202,9 +230,25 @@ default:
 Which further strings are load-bearing is a property of the target MAS's
 prompts, not of FTO, so pass those in from the experiment side — extending
 `DEFAULT_FORCE_TOKENS` rather than replacing it. Anything else
-`compress_prompt` accepts goes through `params`. Compression failures are
-raised, never swallowed: a silent fallback to uncompressed text would make a
-refined restart indistinguishable from an all-context one.
+`compress_prompt` accepts goes through `params`.
+
+**Failure policy is explicit.** `on_error=CompressionFailure.RAISE` (the
+default) lets a compression error fail the run; `PASSTHROUGH` falls back to
+the no-op `ContextCompressor`, logs a warning naming the consequence, and
+marks the turn unrefined. Either way the restart records what happened per
+turn — `restart.compressed` (True/False/None) and `restart.failure` — so a
+benchmark never contains an invisible mix of refined and unrefined restarts.
+
+**Age-tiering**, if a needle test ever shows a flat rate is too aggressive on
+old-but-still-relevant history, is built above this class with two compressors
+rather than one call — `rate` is not part of the model cache key, so they
+share the loaded model at no extra cost:
+
+```python
+older = LLMLinguaCompressor(rate=0.35).compress(history[:-2])
+recent = LLMLinguaCompressor(rate=0.6).compress(history[-2:])
+texts = older.texts + recent.texts   # chronological order preserved
+```
 
 Subclass `ContextCompressor` to plug in another compaction method (an LLM
 summarizer, say) behind the same interface — it takes a list of message texts
