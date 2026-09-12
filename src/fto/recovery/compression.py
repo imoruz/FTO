@@ -61,6 +61,88 @@ DEFAULT_FORCE_TOKENS = STRUCTURAL_FORCE_TOKENS + NEGATION_FORCE_TOKENS
 PROTECTED_SPANS = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
 
 
+# Words whose loss flips a requirement, for checking a compression after the
+# fact. Wider than NEGATION_FORCE_TOKENS on purpose: force_tokens pin single
+# tokens, but "DON'T" is an apostrophe contraction the pinning cannot express,
+# so the validator is what catches it.
+NEGATION_WORDS = re.compile(
+    r'\b(?:not|no|none|never|neither|nor|without|except|unless|cannot'
+    r"|can't|don't|doesn't|didn't|won't|isn't|aren't|wasn't|shouldn't"
+    r"|mustn't|nil|null)\b",
+    re.IGNORECASE,
+)
+
+# An XML-ish delimiter, the kind agent prompts wrap their sections in
+# (<pr_description>, </uploaded_files>).
+DELIMITERS = re.compile(r'</?[A-Za-z_][\w.-]*>')
+
+
+@dataclass
+class CompressionValidator:
+    """Checks a compressed entry is a faithful shortening of the original.
+
+    Token pruning has no notion of meaning, so it will happily produce text
+    that reads as an instruction and says the opposite of one. These are the
+    losses that are objectively detectable by comparing the two strings, so
+    they are checked at runtime rather than hoped about: the caller rejects a
+    failing entry and keeps the original.
+    """
+
+    #: Every negation in the original must still be there. "DON'T have to
+    #: modify the testing logic" compressing to "'T modify testing logic" is
+    #: the case this exists for.
+    negations: bool = True
+    #: Backticked spans and fenced blocks must survive verbatim. Guaranteed by
+    #: PROTECTED_SPANS, so this is a cheap regression check on that guarantee.
+    code_spans: bool = True
+    #: A section delimiter present in the original must still be present, whole.
+    delimiters: bool = True
+
+    def failures(self, original: str, compressed: str) -> List[str]:
+        """Every reason this compression should be rejected; empty means fine."""
+        reasons: List[str] = []
+        if self.negations:
+            reasons += self._missing_negations(original, compressed)
+        if self.code_spans:
+            reasons += self._missing_code_spans(original, compressed)
+        if self.delimiters:
+            reasons += self._missing_delimiters(original, compressed)
+        return reasons
+
+    @staticmethod
+    def _missing_negations(original: str, compressed: str) -> List[str]:
+        from collections import Counter
+
+        before = Counter(w.lower() for w in NEGATION_WORDS.findall(original))
+        after = Counter(w.lower() for w in NEGATION_WORDS.findall(compressed))
+        return [
+            f'negation {word!r} lost ({count}x -> {after[word]}x)'
+            for word, count in before.items()
+            if after[word] < count
+        ]
+
+    @staticmethod
+    def _missing_code_spans(original: str, compressed: str) -> List[str]:
+        lost = [
+            span.group()
+            for span in PROTECTED_SPANS.finditer(original)
+            if span.group() not in compressed
+        ]
+        return [f'code span {span!r} lost' for span in dict.fromkeys(lost)]
+
+    @staticmethod
+    def _missing_delimiters(original: str, compressed: str) -> List[str]:
+        lost = [
+            tag.group()
+            for tag in DELIMITERS.finditer(original)
+            if tag.group() not in compressed
+        ]
+        reasons = [f'delimiter {tag!r} lost' for tag in dict.fromkeys(lost)]
+        if original.count('```') % 2 == 0 and compressed.count('```') % 2:
+            reasons.append('fenced block left unbalanced')
+        return reasons
+
+
 @dataclass
 class CompressionResult:
     """Compressed entries plus what the compression cost in tokens."""

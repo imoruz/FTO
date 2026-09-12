@@ -6,6 +6,7 @@ from fto.recovery.compression import (
     LLMLINGUA2_MODEL,
     LONGLLMLINGUA_MODEL,
     CompressionResult,
+    CompressionValidator,
     ContextCompressor,
     LLMLinguaCompressor,
 )
@@ -449,3 +450,76 @@ class TestShortFragmentThreshold:
 
         long_run = 'word ' * 30
         assert compressor.compress([long_run]).texts != [long_run]
+
+
+class TestCompressionValidator:
+    """Token pruning has no notion of meaning, so a compressed entry is checked
+    against its original before being accepted. These are the losses that are
+    objectively detectable by comparing two strings."""
+
+    def _v(self, **kwargs):
+        return CompressionValidator(**kwargs)
+
+    def test_a_faithful_shortening_passes(self):
+        assert self._v().failures(
+            'You must not skip the `helpers.go` file when writing.',
+            'must not skip `helpers.go` writing',
+        ) == []
+
+    def test_a_lost_negation_fails(self):
+        failures = self._v().failures('you must not skip it', 'you must skip it')
+        assert any("negation 'not' lost" in f for f in failures)
+
+    def test_an_apostrophe_contraction_is_covered(self):
+        # force_tokens pin single tokens and cannot express "DON'T"; this is
+        # the real case that motivated the check.
+        failures = self._v().failures(
+            "You DON'T have to modify the testing logic",
+            "'T modify testing logic",
+        )
+        assert any("don't" in f for f in failures)
+
+    def test_negation_counting_is_per_word(self):
+        # Losing one of several occurrences is still a loss.
+        failures = self._v().failures('not a, not b, not c', 'not a, b, c')
+        assert any('3x -> 1x' in f for f in failures)
+
+    def test_nil_and_null_count_as_negations(self):
+        assert self._v().failures('return nil when unset', 'return when unset')
+        assert self._v().failures('the null case', 'the case')
+
+    def test_a_lost_code_span_fails(self):
+        failures = self._v().failures('read `pkg/cpe/cpe.go` now', 'read `pkg/cpe/cpe.` now')
+        assert any('code span' in f for f in failures)
+
+    def test_a_lost_delimiter_fails(self):
+        failures = self._v().failures(
+            '<pr_description>text</pr_description>', '_description>text'
+        )
+        assert any('<pr_description>' in f for f in failures)
+
+    def test_an_unbalanced_fence_fails(self):
+        failures = self._v().failures('```\ncode\n```', '```\ncode')
+        assert any('unbalanced' in f for f in failures)
+
+    def test_a_balanced_fence_passes_that_check(self):
+        assert not any(
+            'unbalanced' in f
+            for f in self._v().failures('```\na b c\n```', '```\na c\n```')
+        )
+
+    def test_each_check_can_be_switched_off(self):
+        mangled = ("read `a.go` and do not skip <tag>", 'read `a.` skip')
+        assert self._v(negations=False, code_spans=False, delimiters=False).failures(*mangled) == []
+        assert self._v(negations=True, code_spans=False, delimiters=False).failures(*mangled)
+
+    def test_it_reports_every_reason_not_just_the_first(self):
+        failures = self._v().failures(
+            'do not read `a.go` inside <tag>', 'read `a.` inside'
+        )
+        kinds = {f.split()[0] for f in failures}
+        assert kinds == {'negation', 'code', 'delimiter'}
+
+    def test_duplicate_reasons_are_reported_once(self):
+        failures = self._v().failures('`a.go` `a.go` `a.go`', 'nothing')
+        assert len([f for f in failures if 'code span' in f]) == 1

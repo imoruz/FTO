@@ -642,6 +642,7 @@ class TestRestartWithRefinedContext:
 
     def test_the_node_restarts_on_compressed_history_and_a_verbatim_last_message(self):
         messages = [
+            ('user', 'the task statement never changes'),
             ('user', 'the plan says do this and that'),
             ('assistant', 'the report says it is done'),
             ('user', 'the review says fix one more thing'),
@@ -653,37 +654,45 @@ class TestRestartWithRefinedContext:
 
         assert adapter.set_input_calls == [
             [
-                ('user', 'the plan says'),
-                ('assistant', 'the report says'),
-                ('user', 'the review says fix one more thing'),
+                ('user', 'the task statement never changes'),  # protected head
+                ('user', 'the plan says'),                     # compressed
+                ('assistant', 'the report says'),              # compressed
+                ('user', 'the review says fix one more thing'),  # verbatim
             ]
         ]
 
     def test_only_the_history_reaches_the_compressor(self):
         # The active/history split is the restart layer's job: the message the
         # node has to act on must never be handed to the compressor.
-        messages = [('user', 'the plan'), ('user', 'the review')]
+        messages = [
+            ('user', 'the task'), ('user', 'the plan'), ('user', 'the review')
+        ]
         manager, _, adapter, compressor = self.make(messages)
 
         manager.snapshot(adapter)
         manager._restart(lambda: 'ok', adapter)
 
+        # Neither the protected instruction nor the active message is shown.
         assert compressor.seen == [['the plan']]
         assert compressor.question == ''
 
     def test_the_snapshot_survives_the_fault_mangling_the_node_input(self):
-        messages = [('user', 'the plan says do this'), ('user', 'the review')]
+        messages = [
+            ('user', 'the task'),
+            ('user', 'the plan says do this'),
+            ('user', 'the review'),
+        ]
         manager, _, adapter, _ = self.make(messages)
 
         manager.snapshot(adapter)
         # What an injected fault does to the node before it runs.
-        adapter.set_input([('user', 'CORRUPTED'), ('user', 'CORRUPTED')])
+        adapter.set_input([('user', 'X'), ('user', 'CORRUPTED'), ('user', 'X')])
         adapter.set_input_calls.clear()
 
         manager._restart(lambda: 'ok', adapter)
 
         assert adapter.set_input_calls == [
-            [('user', 'the plan'), ('user', 'the review')]
+            [('user', 'the task'), ('user', 'the plan'), ('user', 'the review')]
         ]
 
 

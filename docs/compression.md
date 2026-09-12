@@ -28,24 +28,59 @@ thing" part, because that is where it goes wrong.
 
 ## 2. The one rule
 
-> **Compress every message the node had queued, except the last one.**
+> **Compress the middle of the history. Protect both ends.**
 
-The last message is what the node is being asked to act on *right now* — the
-plan it must implement, or the review it must answer. It goes back verbatim.
-Everything before it is history, and history gets compressed.
+Two kinds of message are held out:
 
-A worked example. The Coder is restarted in the middle of implementing a
-review. Its queue looks like this:
+- **The newest message** is what the node has to act on *right now* — the plan
+  it must implement, or the review it must answer. `keep_last` (default 1,
+  never less than 1).
+- **The oldest message** is instruction-like — the task statement for a
+  planner, the original plan for a coder. `keep_first` (default 1, 0 to
+  disable).
+
+A worked example. The Planner is restarted on a review turn:
 
 ```
-[0] Planner's original plan        →  compressed
-[1] Coder's own earlier report     →  compressed
-[2] Planner's review               →  VERBATIM   ← what it has to answer
+[0]  the task specification        →  PROTECTED  (it is the instruction)
+[1]  its own earlier plan          →  compressed
+[2]  the Coder's report            →  compressed
+[3]  the Coder's newest report     →  VERBATIM   ← what it has to answer
 ```
 
-`keep_last` controls how many messages stay verbatim. It defaults to 1 and is
-clamped to a minimum of 1 — a node restarted with *everything* compressed has
-no clear statement of what it is being asked to do.
+### Why the front is protected too
+
+Because instructions are the content token pruning damages worst, and the
+original design compressed them hardest. Measured on a real run: of a
+17-message context, the task specification was compressed **more aggressively
+than anything else** (to 62% of its length, 108 edit operations), because it is
+prose while the plan is half code and code is protected. Protection was
+*redirecting* the damage onto the instruction.
+
+What that cost, verbatim from the run:
+
+| written in the task spec | came back as |
+| --- | --- |
+| `DON'T have to modify the testing logic` | `'T modify testing logic` |
+| `not rely on implicit zero values` | `not rely values` |
+| `**Current Behavior:**` and `**Expected Behavior:**` | both → `Behavior` |
+| `</uploaded_files>` | deleted |
+
+The third row is the worst: the bug state and the target state become
+indistinguishable. With `keep_first=1` all four survive intact.
+
+> This mirrors LLMLingua's own guidance — its `compress_prompt` has separate
+> `context`, `instruction` and `question` parameters precisely because
+> instructions and questions are compression-sensitive while documents are
+> not. FTO cannot know which message is "the instruction" in a general MAS, so
+> it protects the oldest, which is the closest MAS-agnostic proxy.
+
+**Adding structural characters to `force_tokens` does not fix this** — I tried
+it. Pinning `*`, `<`, `>` and apostrophe contractions recovered **zero** of
+the six lost phrases and introduced the same space-insertion artefact that
+makes `.` unusable (`< tag`, `tag >`). `force_tokens` preserves *tokens*;
+the damage here is the surrounding *words* being dropped, which no token
+pinning can express. Not compressing the instruction is the fix.
 
 ---
 
@@ -96,6 +131,15 @@ small BERT-sized classifier that looks at each token and predicts "keep" or
 "drop", then deletes the drops. The words that come out are a subset of the
 words that went in, in the same order.
 
+**And it was trained on meeting transcripts.** Both released checkpoints
+(`llmlingua-2-xlm-roberta-large-meetingbank`, `llmlingua-2-bert-base-`
+`multilingual-cased-meetingbank`) are distilled on MeetingBank. Go source,
+XML-delimited agent prompts and API contracts are well out of that domain, so
+treat compression quality on code-bearing text as **unvalidated** — which is
+why the safety nets and the needle gate carry the weight here rather than
+trust in the scorer. Upstream ships training scripts if you ever want a
+checkpoint distilled on your own agent transcripts.
+
 So this:
 
 > The relevant implementation is in `contrib/snmp2cpe/pkg/cpe/cpe.go`, and the
@@ -121,10 +165,11 @@ tokens; the installed API uses `rate`, and it is the keep-fraction.)
 
 ---
 
-## 5. The three safety nets
+## 5. The four safety nets
 
 Without these, compression produces text that is not merely shorter — it is
-*wrong in ways that look right*. All three are on by default.
+*wrong in ways that look right*. All four are on by default. The first three
+try to prevent damage; the fourth checks afterwards whether they succeeded.
 
 ### 5.1 `PROTECTED_SPANS` — code never reaches the model
 
@@ -231,6 +276,48 @@ untouched.
 
 ---
 
+### 5.4 `CompressionValidator` — check, don't hope
+
+The first three nets are preventive, and none of them can notice when they
+were insufficient. So every compressed message is compared against its
+original before being accepted, and a message that fails is **rejected — the
+original is kept instead**. Fail-closed, per message, so one bad entry does
+not throw away the compression of the others.
+
+Three checks, all objective string comparisons:
+
+| check | catches |
+| --- | --- |
+| **negations** | any of `not`/`no`/`none`/`never`/`neither`/`nor`/`without`/`except`/`unless`/`cannot`/`nil`/`null` and the apostrophe contractions (`don't`, `won't`, `isn't`, …) occurring fewer times than in the original |
+| **code spans** | a backticked span or fenced block that did not survive verbatim — a regression check on `PROTECTED_SPANS` |
+| **delimiters** | a `<tag>` present in the original and missing from the output, or a fenced block left unbalanced |
+
+The negation check is what covers the gap `force_tokens` cannot: `DON'T` is an
+apostrophe contraction, not a token that can be pinned, so pruning it to `'T`
+is invisible to prevention and obvious to comparison.
+
+Rejections are logged and recorded, so the rejection rate is measurable rather
+than invisible:
+
+```
+[WARN] Refined context: rejected a compressed message and kept the original
+       (negation 'not' lost (12x -> 11x); negation 'null' lost (4x -> 3x)).
+```
+
+Relax individual checks for an ablation:
+
+```python
+CompressionValidator(negations=True, code_spans=True, delimiters=False)
+```
+
+**What this revealed.** Replaying a real navidrome restart context through the
+validator, the Planner's 14,914-character plan was **rejected** — it lost one
+of twelve `not`s, one of four `null`s and two of twenty-five `nil`s. That
+message had previously been assumed fine because its ratio looked mild (94%).
+Faithful token-pruning of a code-heavy agent plan is harder than the ratio
+suggests; see §8 for what that leaves.
+
+
 ## 6. Keeping messages aligned
 
 The compressor returns **one compressed entry per input entry**, in the same
@@ -321,10 +408,40 @@ pod with a cold Hugging Face cache.
 If you run in containers: bake the model into the image, and give the pod a
 GPU if you can. Compression should be seconds, not minutes.
 
-**Protection lowers the compression ratio**, because code no longer counts
-toward the savings. On a code-dense plan at `rate=0.55` expect ~80% of the
-original rather than ~60%. Buy the budget back by lowering `rate` — the prose
-absorbs it and the code stays intact either way:
+### Is it even worth it? Read this before designing an experiment
+
+Protection lowers the compression ratio, because code no longer counts toward
+the savings. Stack all four nets and the saving on a real workload gets small:
+
+| configuration | achieved ratio | task spec |
+| --- | --- | --- |
+| no head protection, no validator | 86.8% | compressed to 62%, 5 of 6 key phrases lost |
+| `keep_first=1` + validator (current default) | **92.5%** | intact, all 6 phrases kept |
+
+**7.5% of tokens saved.** That is the honest number for a 17-message
+Planner context on a code-heavy Go instance: the instruction is protected, the
+plan is half backticked code and gets rejected by the validator for a lost
+negation, and what remains to compress is short exploration notes.
+
+Two consequences worth being explicit about:
+
+- On this kind of workload, a refined-context restart is **barely
+  distinguishable from an all-context restart**. If you are comparing the two
+  arms, check `restart.compressed` and the achieved ratio per turn before
+  attributing any difference to compression.
+- The semantic risk is unpaid for at that ratio. The two benefit gates exist
+  to say so out loud: `min_chars` skips compression when the compressible
+  history is small, and `min_saving` discards a compression that saved less
+  than a given fraction. Both default to off so existing configs keep their
+  behaviour; `min_saving=0.2` would have skipped this turn entirely.
+
+If you want a real token saving on this MAS, the lever is not a lower `rate` —
+it is compressing the content that actually holds the token mass. A Coder
+phase is hundreds of file reads and searches; that is low-sensitivity context
+and it never reaches the refined restart at all, because only the agents'
+final messages do.
+
+Lowering `rate` still buys prose back, and the code stays intact either way:
 
 | `rate` | ratio achieved | code kept | negations kept |
 | --- | --- | --- | --- |
@@ -410,9 +527,35 @@ Either way, the restart records what happened, per turn:
 | `restart.compressed` | `True` compressed, `False` not, `None` not attempted yet |
 | `restart.failure` | why it wasn't, when it wasn't |
 | `restart.last_result` | the `CompressionResult`, including token counts |
+| `restart.records` | one `MessageRecord` per message: index, policy, chars before/after, validator failures |
 
 Read `compressed` when collecting results so a run never contains an
-invisible mix.
+invisible mix. `MessageRecord.policy` is one of `verbatim-head`,
+`verbatim-tail`, `compressed`, `rejected` or `unchanged`, and `.mutated`
+compares chars before and after — **a `verbatim-*` record with
+`mutated=True` is a bug**, since the whole point of the protected ends is that
+they come back untouched. Worth asserting in any analysis script.
+
+### A confound this is *not*
+
+If you diff a faulty node's input against the restarted node's input, the
+newest message will look shorter, and it is tempting to read that as
+compression truncating a message it promised to keep verbatim. It isn't.
+
+Verified on a real run: the faulty Planner's newest message was 5690
+characters, the restarted Planner's was 5018, and the 5018 is **byte-identical
+to the Coder's actual output**. The 672-character difference is the injected
+FM-2.2 payload, which the snapshot legitimately excludes because the snapshot
+is taken *before* the fault is applied. Nothing truncated anything.
+
+The related worry — "a fault that gets compressed away is not a fault that was
+survived" — is worth stating precisely. Every restart mode rewinds past the
+fault; that is what restoring a pre-fault snapshot means, and it is equally
+true of `RestartAllContext`. What FTO measures is recovery by rewind, not
+survival under a persisting fault. Fault *delivery* is separately enforced:
+`AegisFault.apply` raises `FaultInjectionError` if the injected text never
+reached the node, so a run cannot be scored as a recovery when no fault
+landed.
 
 ---
 
@@ -425,7 +568,10 @@ restart:
   mode: refinedcontext
   count: 1
   keep_last: 1          # messages kept verbatim, newest first
+  keep_first: 1         # messages held out at the front (the instruction)
   on_error: raise       # raise | passthrough
+  min_chars: 0          # skip compression below this much history
+  min_saving: 0.0       # discard a compression that saved less than this
   compression:
     use_llmlingua2: true          # false = LongLLMLingua (7B, query-aware)
     # model: microsoft/llmlingua-2-xlm-roberta-large-meetingbank
@@ -486,4 +632,7 @@ shapes, including keeping attachments in place.
 | Don't assume literals are safe because they look like code | Protection is by backtick. Quote them. |
 | Don't run this on CPU in a container without checking | One run spent 606s (78% of execution) compressing. |
 | Don't change the rate without re-running the needle test | Nothing else will tell you it broke. |
-| Don't report a run as refined without checking `restart.compressed` | `PASSTHROUGH` runs are not refined. |
+| Don't report a run as refined without checking `restart.compressed` | `PASSTHROUGH`, skipped and rejected turns are not refined. |
+| Don't try to protect prose by adding characters to `force_tokens` | Tested: recovers nothing, and `*`/`<`/`>` add spacing damage. Use `keep_first`. |
+| Don't read a shorter newest message as truncation | It is the fault payload the snapshot excludes. See §11. |
+| Don't assume a mild ratio means a faithful message | The plan compressed to 94% and still lost a negation. |
