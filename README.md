@@ -148,37 +148,93 @@ input.
 > Full walkthrough of the compression mechanism — what it protects and why,
 > what it costs, how to pick a rate, and the gotchas: **[docs/compression.md](docs/compression.md)**.
 
-`RestartRefinedContext` compresses every message the node had queued except the
-last `keep_last` (default 1). Those last ones are what the node is being asked
-to act on right now, so they go back in verbatim. In a planner/coder loop, a
-coder restarted mid-implementation comes back to a compressed plan and a
-compressed copy of its own earlier report, but to the review it has to answer
-in full.
+`RestartRefinedContext` rebuilds the node's context in four zones rather than
+compressing it uniformly:
+
+| zone | what it holds | policy |
+| --- | --- | --- |
+| **head** | the oldest message — the task statement for a planner, the original plan for a coder | verbatim (`keep_first`, default 1) |
+| **Z1 — pinned state** | open assumptions, concerns, plan deviations, the edit ledger, and the resumption marker, lifted out of the history | regenerated structurally, never compressed |
+| **history** | everything in between | compressed |
+| **tail** | the newest message — what the node has to act on | verbatim, *or* compressed along its own structure |
+
+Instructions are what token pruning damages worst, which is why both ends are
+held out: on a real run the task specification was the most aggressively
+compressed message in the whole context, losing `DON'T have to modify the
+testing logic` and collapsing `Current Behavior` and `Expected Behavior` into
+the same label.
 
 Compression rewrites only the text inside a message: roles, sources, keep
 flags and attachments are preserved, and tool-call messages are passed through
 untouched so their pairing stays intact. That is what keeps the refined
 context a valid input for the same node.
 
+**Two tail modes, chosen in the config file.** `keep_last_verbatim: true` (the
+default) hands the newest message back whole. `false` compresses it too — but
+along its own labels, so the scaffold the next agent is told to read survives
+and each field is compressed by what it is worth:
+
+```
+THOUGHT:  compressed hard   — the agent narrating a turn that already happened
+ACTION:   ...
+OUTPUT: / REPORT:           — the artefact the next agent consumes; protected
+  CONCERNS: / REMAINING:    — verbatim; these gate TASK_COMPLETE
+```
+
+Those labels are ReAct's [\[1\]](https://arxiv.org/abs/2210.03629) — the
+target MAS declares itself a ReAct loop — and the split follows from the
+trace: the reasoning half is history, the report half is the next agent's
+instruction. Which labels exist and what each is worth comes from the
+experiment config, not from FTO.
+
 ```python
 from fto.recovery import DEFAULT_FORCE_TOKENS, LLMLinguaCompressor, RestartRefinedContext
 
+compressor = LLMLinguaCompressor(
+    rate=0.55,          # fraction of tokens to keep
+    protect_code=True,  # hold code out of the compressor (default)
+    force_tokens=[*DEFAULT_FORCE_TOKENS, 'TASK_COMPLETE'],  # never dropped
+)
+
 restart = RestartRefinedContext(
     restart_count=2,
-    keep_last=1,
-    compressor=LLMLinguaCompressor(
-        rate=0.55,          # fraction of tokens to keep
-        protect_code=True,  # hold code out of the compressor (default)
-        force_tokens=[*DEFAULT_FORCE_TOKENS, 'TASK_COMPLETE'],  # never dropped
-    ),
-    logger=logger,          # logs the compression ratio
+    keep_first=1,       # the instruction, held out
+    keep_last=1,        # the active message
+    compressor=compressor,
+    logger=logger,      # logs the compression ratio and what it did per message
+)
+```
+
+To compress the tail along its structure instead of keeping it whole, pass an
+`active_compressor`:
+
+```python
+from fto.recovery import SectionPolicy, StructuredCompressor
+
+structured = StructuredCompressor(
+    sections=[
+        SectionPolicy('THOUGHT', 0.3),      # narration of a past turn
+        SectionPolicy('ACTION', 0.9),
+        SectionPolicy('OBSERVATION', 0.5),
+        SectionPolicy('EDITS', 0.9),        # the record of what changed
+        SectionPolicy('CONCERNS', None),    # None keeps a section verbatim
+        SectionPolicy('REMAINING', None),
+    ],
+    template=compressor,   # same model, force tokens and protections
+)
+
+restart = RestartRefinedContext(
+    compressor=compressor,
+    active_compressor=structured,   # None (default) keeps the tail whole
 )
 ```
 
 Compression is [LLMLingua](https://github.com/microsoft/LLMLingua) token
-pruning. `LLMLinguaCompressor` defaults to LLMLingua-2 (a small token
-classifier, one batched pass over the history, honours `force_tokens`); set
-`use_llmlingua2=False` for LongLLMLingua, which compresses each message
+pruning [\[2\]](https://arxiv.org/abs/2310.05736). `LLMLinguaCompressor`
+defaults to LLMLingua-2 [\[3\]](https://arxiv.org/abs/2403.12968) (a small
+token classifier, one batched pass over the history, honours `force_tokens`); set
+`use_llmlingua2=False` for LongLLMLingua
+[\[4\]](https://arxiv.org/abs/2310.06839), which compresses each message
 conditioned on the kept-verbatim one but needs a 7B causal model and ignores
 `force_tokens`. The model loads lazily on first use and is then reused, and
 each snapshot is compressed once however many restart attempts follow — later
@@ -451,6 +507,32 @@ For [refined-context restarts](#refined-context) also implement `context_as_list
 ### Custom checkpoint
 
 Subclass `Checkpoint` and implement `save_baseline`, `save`, and `restore`.
+
+---
+
+## References
+
+**[1]** Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., & Cao,
+Y. (2023). *ReAct: Synergizing Reasoning and Acting in Language Models.* ICLR
+2023. [arXiv:2210.03629](https://arxiv.org/abs/2210.03629) — the
+`THOUGHT / ACTION / OBSERVATION` trace the target MAS is built on, and that
+the [structure-aware policy](docs/compression.md) keys on.
+
+**[2]** Jiang, H., Wu, Q., Lin, C.-Y., Yang, Y., & Qiu, L. (2023).
+*LLMLingua: Compressing Prompts for Accelerated Inference of Large Language
+Models.* EMNLP 2023. [arXiv:2310.05736](https://arxiv.org/abs/2310.05736)
+
+**[3]** Pan, Z., Wu, Q., Jiang, H., Xia, M., Luo, X., Zhang, J., Lin, Q.,
+Rühle, V., Yang, Y., Lin, C.-Y., Zhao, H. V., Qiu, L., & Zhang, D. (2024).
+*LLMLingua-2: Data Distillation for Efficient and Faithful Task-Agnostic
+Prompt Compression.* Findings of ACL 2024.
+[arXiv:2403.12968](https://arxiv.org/abs/2403.12968) — the default compressor.
+
+**[4]** Jiang, H., Wu, Q., Luo, X., Li, D., Lin, C.-Y., Yang, Y., & Qiu, L.
+(2024). *LongLLMLingua: Accelerating and Enhancing LLMs in Long Context
+Scenarios via Prompt Compression.* ACL 2024.
+[arXiv:2310.06839](https://arxiv.org/abs/2310.06839) — the query-aware variant
+(`use_llmlingua2=False`).
 
 ---
 

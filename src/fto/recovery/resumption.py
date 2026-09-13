@@ -67,6 +67,10 @@ class PinnedField:
 
     label: str
     title: str
+    #: Replace this section's body in the message with this line, instead of
+    #: leaving a second verbatim copy behind the block. ``{title}`` is
+    #: substituted. None keeps both copies.
+    pointer: str | None = None
     ledger: bool = False
     #: Keep only the most recent turn's value. The Coder restates CONCERNS
     #: and PLAN_DEVIATIONS in full every turn, so the latest one supersedes;
@@ -110,6 +114,7 @@ class ResumptionPolicy:
                 PinnedField(
                     label=s.label,
                     title=s.pin,
+                    pointer=getattr(s, 'pin_pointer', None),
                     ledger=normalise_label(s.label) == 'edits',
                     latest_only=normalise_label(s.label) != 'edits',
                 )
@@ -126,6 +131,11 @@ class ResumptionState:
 
     def __init__(self, policy: ResumptionPolicy) -> None:
         self.policy = policy
+        #: (entry index, pin title) pairs the last ``build`` actually rendered.
+        #: Only these may be replaced by a pointer -- a section that was
+        #: harvested but superseded by a later turn is still the only copy of
+        #: its own wording.
+        self.rendered: set = set()
         self._by_key = {normalise_label(f.label): f for f in policy.fields}
         labels = list(policy.boundary_labels) or [f.label for f in policy.fields]
         for pinned in policy.fields:
@@ -144,6 +154,7 @@ class ResumptionState:
             return ''
 
         found = self._harvest(texts)
+        self.rendered = set()
         lines = [self.policy.heading, self._marker(texts)]
         loop_guard = self._loop_guard(texts)
         if loop_guard:
@@ -159,6 +170,54 @@ class ResumptionState:
         lines += body
         lines.append(self.policy.authority_note)
         return '\n'.join(lines)
+
+    def strip_pinned(self, index: int, text: str) -> str:
+        """Replace pinned bodies in one entry with their pointer line.
+
+        Only sections this block actually rendered from *this* entry are
+        touched, and only those configured with a ``pointer``. The label and
+        the surrounding whitespace stay, so the message keeps its shape and
+        the agent still finds the field; what goes is the second verbatim
+        copy of text the block already carries.
+
+        Call it only when ``build`` returned a block, or the pointer dangles.
+        """
+        if self._pattern is None or not text or not self.rendered:
+            return text
+
+        matches = list(self._pattern.finditer(text))
+        out, at = [], 0
+        for k, match in enumerate(matches):
+            pinned = self._by_key.get(normalise_label(match.group(0)))
+            if pinned is None or not pinned.pointer:
+                continue
+            if (index, pinned.title) not in self.rendered:
+                continue
+            end = matches[k + 1].start() if k + 1 < len(matches) else len(text)
+            body = text[match.end() : end]
+            kept = _trailing_markers_of(body, self.policy.trailing_markers)
+            stripped = _strip_markers(body, self.policy.trailing_markers)
+            if not stripped:
+                continue
+            # A pointer is only worth it when it is shorter than what it
+            # replaces. "REMAINING: none" pointed at the block is strictly
+            # worse than "REMAINING: none", and no configuration should be
+            # able to make that trade by accident.
+            pointer = pinned.pointer.format(title=pinned.title)
+            if len(pointer) >= len(stripped.strip()):
+                continue
+            # Keep the body's own leading break, so a `## Heading` label --
+            # whose match stops at the end of its line -- does not end up
+            # welded to the pointer, while a `LABEL: ` one stays inline.
+            lead = body[: len(body) - len(body.lstrip('\n'))]
+            trail = body[len(body.rstrip()) :]
+            out.append(text[at : match.end()])
+            out.append(lead + pinned.pointer.format(title=pinned.title) + kept + trail)
+            at = end
+        if not out:
+            return text
+        out.append(text[at:])
+        return ''.join(out)
 
     def _harvest(self, texts: List[str]) -> Dict[str, List[Tuple[int, str]]]:
         """Every pinned section body, as ``title -> [(turn, body), ...]``."""
@@ -189,6 +248,8 @@ class ResumptionState:
         # Both agents restate these fields in full every turn, so the latest
         # statement supersedes the rest.
         chosen = hits[-1:] if pinned.latest_only else hits
+        # turn numbers are 1-based; the entry index is what strip_pinned keys on
+        self.rendered.update((turn - 1, pinned.title) for turn, _ in chosen)
         return [
             line
             for turn, body in chosen
@@ -236,6 +297,21 @@ class ResumptionState:
             f"does not consume another: the faulty attempt's outgoing edges "
             f'are withheld and only the successful attempt is released.'
         )
+
+
+def _trailing_markers_of(body: str, markers: List[str]) -> str:
+    """The routing markers trailing a body, to re-attach after a pointer.
+
+    ``READY_FOR_REVIEW`` sits after the Coder's last field but belongs to the
+    message, not the field -- dropping it with the body would break routing.
+    """
+    kept = []
+    rest = body.rstrip()
+    for marker in markers:
+        if rest.endswith(marker):
+            kept.insert(0, marker)
+            rest = rest[: -len(marker)].rstrip()
+    return ('\n\n' + '\n\n'.join(kept)) if kept else ''
 
 
 def _strip_markers(body: str, markers: List[str]) -> str:

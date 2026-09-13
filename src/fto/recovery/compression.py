@@ -683,9 +683,17 @@ class SectionPolicy:
     label: str
     rate: float | None = None
     #: Also lift this section into the pinned resumption state block (Z1),
-    #: under this title. The section stays where it is as well: the block is
-    #: a restatement at the top of the prompt, not a move.
+    #: under this title. By default the section stays where it is as well:
+    #: the block is a restatement at the top of the prompt, not a move.
     pin: str | None = None
+    #: ...unless this is set, in which case the body is replaced *in place*
+    #: by this line and the content lives once, in Z1. The label stays, so
+    #: the scaffold is intact and the agent still finds the field where its
+    #: prompt tells it to look -- only the duplicate text goes. Measured on a
+    #: real restart, pinning `## Assumptions & Open Questions` verbatim *and*
+    #: keeping it cost 1,264 duplicated characters, about 9% of the prompt.
+    #: ``{title}`` in the text is replaced with the pin title.
+    pin_pointer: str | None = None
 
     @property
     def key(self) -> str:

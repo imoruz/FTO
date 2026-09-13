@@ -82,7 +82,8 @@ What that cost, verbatim from the run:
 The third row is the worst: the bug state and the target state become
 indistinguishable. With `keep_first=1` all four survive intact.
 
-> This mirrors LLMLingua's own guidance — its `compress_prompt` has separate
+> This mirrors LLMLingua's own guidance [\[2\]][llmlingua] — its
+> `compress_prompt` has separate
 > `context`, `instruction` and `question` parameters precisely because
 > instructions and questions are compression-sensitive while documents are
 > not. FTO cannot know which message is "the instruction" in a general MAS, so
@@ -143,6 +144,11 @@ This is the mental model that prevents most surprises.
 small BERT-sized classifier that looks at each token and predicts "keep" or
 "drop", then deletes the drops. The words that come out are a subset of the
 words that went in, in the same order.
+
+LLMLingua-2 [\[3\]][llmlingua2] formulates compression as token
+classification and distils the labels from GPT-4, which is what makes it
+faithful — the output is guaranteed to be a subsequence of the input — and
+what makes it task-agnostic.
 
 **And it was trained on meeting transcripts.** Both released checkpoints
 (`llmlingua-2-xlm-roberta-large-meetingbank`, `llmlingua-2-bert-base-`
@@ -405,9 +411,24 @@ Both on the same real contexts:
 
 ### Why a blob is the wrong shape
 
-An agent message in a ReAct loop is not prose, it is a form. The Coder's prompt
-tells it to emit exactly these fields, and the Planner's prompt tells it to
-read them by name:
+An agent message in a ReAct loop is not prose, it is a form — and the form is
+not incidental. The target MAS declares itself one: the graph is
+`SWEBench_PlannerCoder_ReAct` and both role prompts open with *"You are a
+senior software engineer acting as a Planner / Coder in a ReAct loop"*
+([`swe_bench_planner_coder_react.yaml`][spec]). ReAct [\[1\]][react] is what
+puts `THOUGHT / ACTION / OBSERVATION` there: its contribution is interleaving
+a reasoning trace with task-specific actions, so the reasoning can revise the
+plan while the actions gather what the reasoning needs.
+
+That matters for compression because the two halves of the trace are not the
+same kind of content. The reasoning trace is the agent narrating a turn that
+has **already happened**; the report or plan at the end is the artefact the
+**next** agent consumes. Losing narration costs a restarted agent some of its
+own history. Losing a field the receiving agent's prompt tells it to read
+costs the loop its control flow.
+
+The Coder's prompt tells it to emit exactly these fields, and the Planner's
+prompt tells it to read them by name:
 
 ```
 THOUGHT:         what the plan asked for              (restates what it was told)
@@ -636,6 +657,43 @@ silent failure of the whole restart, not of compression.
   `READY_FOR_REVIEW` trails `REMAINING` and belongs to the message rather than
   to the field.
 
+### Pinning moves content; it should not copy it
+
+By default a pinned section is restated at the top *and* left where it was.
+For a section that is also `rate: null`, that is two verbatim copies of the
+same text, and it is expensive: measured on a real first-Coder restart, the
+seven assumption items appeared once in Z1 (1,304 chars) and again in the
+untouched `## Assumptions & Open Questions` tail (1,264 chars), and the
+reconstructed prompt came out **10.4% larger** than the message it replaced —
+compression saved 121 tokens while the block spent 392.
+
+Set `pin_pointer` on such a section and the body is replaced *in place* by a
+pointer line:
+
+```
+## Assumptions & Open Questions
+(see OPEN ASSUMPTIONS in the resumption state block above)
+```
+
+The label stays, so the message keeps its shape and the agent still finds the
+field where its prompt tells it to look; only the duplicate text goes. On that
+same run this recovered **1,204 chars / 268 tokens — 10.6% of the prompt** —
+and took the reconstruction from +10.4% to −1.3% against the original.
+
+Three rules keep it honest, none of them configurable:
+
+- **Only what the block actually quoted.** `latest_only` means an older turn's
+  concern is superseded in Z1 but is still the only record of its own wording,
+  so it keeps its body.
+- **Only when the pointer is shorter than the body.** `REMAINING: none` behind
+  a 52-character pointer is strictly worse, so it is left alone.
+- **Only once the block exists.** Nothing is stripped when `build` produced
+  no block, or the pointer would refer to nothing.
+
+A ledger field (`EDITS`) should *not* get a pointer: Z1 renders it as a
+`path -> line refs` summary rather than the original prose, so pointing at it
+loses the description.
+
 ### Where it goes
 
 Immediately after the protected head and before the compressed history —
@@ -708,7 +766,7 @@ code implies a conditioning that is not happening, and the log line records
 which it was. **Don't add `question=` back in LLMLingua-2 mode** — it will be
 discarded, and the next reader will believe it wasn't.
 
-(LongLLMLingua — `use_llmlingua2=False` — *is* query-aware, and is the only
+(LongLLMLingua [\[4\]][longllmlingua] — `use_llmlingua2=False` — *is* query-aware, and is the only
 mode where `uses_question` is True. It needs a 7B model and ignores
 `force_tokens`, which is why it is not the default.)
 
@@ -1019,6 +1077,58 @@ shapes, including keeping attachments in place.
 | Don't rely on backticks for paths and line numbers | Agents write most of them unquoted. `protect_identifiers` is what saves those. |
 | Don't defend a heading with `force_tokens` | Pinning `####` still yields `### # 1:`. `protect_headings` holds the whole line out. |
 | Don't turn a protection off without relaxing its validator check | You get mass rejection, not an ablation. |
+| Don't pin a section verbatim and leave it in place too | Two copies of the same text. Set `pin_pointer`; it recovered 10.6% of one real prompt. |
+| Don't give a ledger field a pointer | Z1 renders `EDITS` as a summary, not the prose. Pointing at it loses detail. |
 | Don't assume Z1 adjudicates | It restates the *latest* concerns and deviations, not the unresolved ones. See §5c. |
 | Don't restart an agent without a resumption marker | Both role prompts ask "is this your first turn?". It answers wrong, re-plans, and burns a LoopGuard iteration. |
 | Don't assume a first-turn restart compressed anything | With one message and `keep_last_verbatim: true` there is nothing to compress. Check `restart.compressed`. |
+
+---
+
+## 15. References
+
+The mechanism sits on two lines of work: the agent scaffold the target MAS is
+built from, and the prompt-compression family the compressor comes from.
+
+**[1]** <a id="react"></a>Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I.,
+Narasimhan, K., & Cao, Y. (2023). *ReAct: Synergizing Reasoning and Acting in
+Language Models.* ICLR 2023. [arXiv:2210.03629](https://arxiv.org/abs/2210.03629)
+
+> Why it is cited here: the `THOUGHT / ACTION / OBSERVATION` trace that §5b's
+> section policy keys on is ReAct's, and the MAS spec file declares itself a
+> ReAct loop. The split the policy makes — compress the reasoning trace of a
+> turn that already happened, protect the artefact the next agent consumes —
+> is a split ReAct's own structure hands you.
+
+**[2]** <a id="llmlingua"></a>Jiang, H., Wu, Q., Lin, C.-Y., Yang, Y., & Qiu,
+L. (2023). *LLMLingua: Compressing Prompts for Accelerated Inference of Large
+Language Models.* EMNLP 2023.
+[arXiv:2310.05736](https://arxiv.org/abs/2310.05736)
+
+> The original perplexity-based compressor and the budget controller. Not the
+> default here, but the `compress_prompt` API this code calls is its API.
+
+**[3]** <a id="llmlingua2"></a>Pan, Z., Wu, Q., Jiang, H., Xia, M., Luo, X.,
+Zhang, J., Lin, Q., Rühle, V., Yang, Y., Lin, C.-Y., Zhao, H. V., Qiu, L., &
+Zhang, D. (2024). *LLMLingua-2: Data Distillation for Efficient and Faithful
+Task-Agnostic Prompt Compression.* Findings of ACL 2024.
+[arXiv:2403.12968](https://arxiv.org/abs/2403.12968)
+
+> The default compressor (`use_llmlingua2=True`). Token classification over a
+> BERT-size encoder, distilled from GPT-4 on MeetingBank — which is where §4's
+> domain caveat comes from, and why it is task-agnostic and discards
+> `question` (§7).
+
+**[4]** <a id="longllmlingua"></a>Jiang, H., Wu, Q., Luo, X., Li, D., Lin,
+C.-Y., Yang, Y., & Qiu, L. (2024). *LongLLMLingua: Accelerating and Enhancing
+LLMs in Long Context Scenarios via Prompt Compression.* ACL 2024.
+[arXiv:2310.06839](https://arxiv.org/abs/2310.06839)
+
+> The query-aware variant, reached with `use_llmlingua2=False`. The only mode
+> where `uses_question` is True, and the reason that flag exists at all.
+
+[react]: https://arxiv.org/abs/2210.03629
+[llmlingua]: https://arxiv.org/abs/2310.05736
+[llmlingua2]: https://arxiv.org/abs/2403.12968
+[longllmlingua]: https://arxiv.org/abs/2310.06839
+[spec]: https://github.com/imoruz/FTOexperiments/blob/main/src/experiments/chatdev/instances/swe_bench_planner_coder_react.yaml

@@ -302,6 +302,18 @@ class RestartRefinedContext(Restart):
         block = self.resumption.build(originals)
         if not block:
             return refined
+
+        # The block now carries these fields verbatim, so any section
+        # configured with a pointer gives up its second copy. Done only once
+        # the block exists, or the pointer would refer to nothing.
+        for index in range(head, len(refined)):
+            current = refined[index] or originals[index]
+            pointed = self.resumption.strip_pinned(index, current)
+            if pointed != current:
+                refined[index] = pointed
+                if index < len(self.records):
+                    self.records[index].chars_after = len(pointed)
+
         for index in range(head, len(refined)):
             current = refined[index] or originals[index]
             if not current.strip():
