@@ -353,3 +353,121 @@ def test_every_label_this_mas_emits_is_matchable(label):
         sections=[SectionPolicy(label, 0.5)], template=FakeTemplate()
     )
     assert compressor.labels_of(f'{label}: some body text here') == [f'{label}: ']
+
+
+class TestFirstTurnRestart:
+    """A node restarted on its first turn has exactly one message.
+
+    That message is simultaneously the oldest and the newest. Giving the
+    protected head priority left the tail empty, so a first-turn restart
+    compressed nothing at all and behaved like RestartAllContext -- observed
+    on a real run where the restarted Coder got back the Planner's 10,178
+    character plan byte for byte.
+    """
+
+    def _restart(self, messages, **kwargs):
+        from fto.recovery import RestartRefinedContext
+        from tests.recovery.test_restart import (
+            FakeAdapter,
+            FakeCompressor,
+            make_context,
+        )
+
+        restart = RestartRefinedContext(compressor=FakeCompressor(), **kwargs)
+        restart.set_context(make_context(*messages), adapter=FakeAdapter())
+        return restart
+
+    def test_the_only_message_is_the_active_one_not_the_head(self):
+        restart = self._restart([('user', CODER_REPORT)], active_compressor=make())
+
+        refined = restart.get_context()
+
+        assert refined[0].text != CODER_REPORT, 'the lone message was not compressed'
+        assert [r.policy for r in restart.records] == ['compressed-structured']
+
+    def test_its_structure_still_survives(self):
+        restart = self._restart([('user', CODER_REPORT)], active_compressor=make())
+
+        out = restart.get_context()[0].text
+
+        for label in ('THOUGHT:', 'ACTION:', 'CONCERNS:', 'REMAINING:'):
+            assert label in out, label
+        assert 'the fallback path must never be reached' in out
+
+    def test_the_turn_is_recorded_as_compressed(self):
+        restart = self._restart([('user', CODER_REPORT)], active_compressor=make())
+
+        restart.get_context()
+
+        assert restart.compressed is True
+        assert restart.failure is None
+
+    def test_without_a_tail_compressor_there_is_still_nothing_to_do(self):
+        # One message, kept verbatim: correct, and correctly reported.
+        restart = self._restart([('user', CODER_REPORT)])
+
+        assert restart.get_context()[0].text == CODER_REPORT
+        assert restart.compressed is False
+        assert 'nothing to compress' in restart.failure
+
+    def test_two_messages_split_the_same_way_as_before(self):
+        # Only the one-message case changes; the head still wins from two up.
+        restart = self._restart(
+            [('user', 'the task'), ('user', CODER_REPORT)], active_compressor=make()
+        )
+
+        restart.get_context()
+
+        assert [r.policy for r in restart.records] == [
+            'verbatim-head',
+            'compressed-structured',
+        ]
+
+    def test_three_messages_still_put_the_plan_in_the_middle(self):
+        restart = self._restart(
+            [('user', 'the task'), ('assistant', 'the plan'), ('user', CODER_REPORT)],
+            active_compressor=make(),
+        )
+
+        restart.get_context()
+
+        assert [r.policy for r in restart.records] == [
+            'verbatim-head',
+            'compressed',
+            'compressed-structured',
+        ]
+
+    def test_an_empty_history_does_not_call_the_history_compressor(self):
+        from tests.recovery.test_restart import FakeCompressor
+
+        history = FakeCompressor()
+        restart = self._restart([('user', CODER_REPORT)], active_compressor=make())
+        restart.compressor = history
+        restart.set_context(restart.context, adapter=restart.adapter)
+
+        restart.get_context()
+
+        assert history.calls == []
+
+    def test_a_failing_tail_compressor_obeys_the_passthrough_policy(self):
+        class Boom(ContextCompressor):
+            def compress(self, contexts, question=''):
+                raise RuntimeError('boom')
+
+        restart = self._restart(
+            [('user', CODER_REPORT)], active_compressor=Boom(), on_error='passthrough'
+        )
+
+        assert restart.get_context()[0].text == CODER_REPORT
+        assert restart.compressed is False
+        assert 'boom' in restart.failure
+
+    def test_a_failing_tail_compressor_raises_by_default(self):
+        class Boom(ContextCompressor):
+            def compress(self, contexts, question=''):
+                raise RuntimeError('boom')
+
+        restart = self._restart([('user', CODER_REPORT)], active_compressor=Boom())
+
+        with pytest.raises(RuntimeError, match='boom'):
+            restart.get_context()

@@ -322,9 +322,24 @@ suggests; see §8 for what that leaves.
 
 ## 5b. Structure-aware compression of the newest message
 
-By default the newest message is handed back whole, because it is what the node
-has to act on. Give the restart an `active_compressor` and it is compressed
-too — but **along its own labels** rather than as one blob.
+There are **two configurable modes**, and the config file picks between them:
+
+| `keep_last_verbatim` | the newest message | config |
+| --- | --- | --- |
+| `true` (default) | handed back **whole** | `inj_refinedctx/aegis_FM22.yaml` |
+| `false` | compressed **along its own labels** | `inj_refinedctx/aegis_FM22_structured.yaml` |
+
+The default is unchanged from before this mode existed: the newest message is
+what the node has to act on, so it goes back intact. Setting the flag to
+`false` gives the restart an `active_compressor` and the tail is compressed
+too — but along its structure rather than as one blob.
+
+Both on the same real contexts:
+
+| context | intact mode | structured mode |
+| --- | --- | --- |
+| first Coder, 1 message (10,178 ch) | unchanged, nothing compressed | 9,491 ch (93%), structure intact |
+| later Planner, 8 messages (19,029 ch) | 18,312 ch, tail unchanged at 5,024 | 18,024 ch, tail 5,024 → 4,736 |
 
 ### Why a blob is the wrong shape
 
@@ -373,6 +388,25 @@ intact:
 And on a real Planner plan, 8662 → 8310 with all seven of its labels
 (`THOUGHT`, `ACTION`, `OBSERVATION`, `OUTPUT`, `## Analysis`, `## Fix Plan`,
 `## Assumptions & Open Questions`) in place and `THOUGHT` cut to 32%.
+
+### The first turn is the case to get right
+
+A node restarted on its **very first turn** has exactly one message — the plan
+a Coder was just handed. That message is simultaneously the oldest and the
+newest, so the head and the tail compete for it, and the tail wins: it is what
+the node has to act on, and it is the only way structure-aware compression can
+fire on a first turn at all.
+
+This was a bug worth naming, because it is silent. With the head taking
+priority the tail came out empty, nothing was compressed, and the restart
+quietly behaved like `RestartAllContext` — observed on a real run where the
+restarted Coder got the Planner's 10,178-character plan back byte for byte,
+with only a `skipped compression` line in the log to say so. For any context
+of two or more messages the split is unchanged.
+
+The guards were wrong in the same way: they asked whether the *history* was
+empty, so a context whose only compressible content was the tail skipped too.
+They now measure whatever is actually compressible, in both zones.
 
 ### Writing the policy
 
@@ -743,3 +777,4 @@ shapes, including keeping attachments in place.
 | Don't read a shorter newest message as truncation | It is the fault payload the snapshot excludes. See §11. |
 | Don't assume a mild ratio means a faithful message | The plan compressed to 94% and still lost a negation. |
 | Don't compress a labelled agent message as one blob | It applies one rate to every field and can dissolve the labels. Use `keep_last_verbatim: false` with a `structure:` policy. |
+| Don't assume a first-turn restart compressed anything | With one message and `keep_last_verbatim: true` there is nothing to compress. Check `restart.compressed`. |

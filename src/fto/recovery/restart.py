@@ -184,26 +184,37 @@ class RestartRefinedContext(Restart):
 
         texts = self.adapter.context_as_list(self.context)
         head, history, latest = self._split(texts)
-        if not any(text.strip() for text in history):
+
+        # Everything that could be compressed: the history always, and the
+        # tail too when a compressor was given for it.
+        payload = [text for text in history if text.strip()]
+        if self.active_compressor is not None:
+            payload += [text for text in latest if text.strip()]
+
+        if not payload:
             self._skip(
                 head,
                 history,
                 latest,
-                'nothing to compress between the '
-                'protected head and the kept-verbatim tail',
+                'nothing to compress outside the protected head'
+                + ('' if self.active_compressor else ' and the verbatim tail'),
             )
             return None
-        if sum(len(text) for text in history) < self.min_chars:
+        if sum(len(text) for text in payload) < self.min_chars:
             self._skip(
                 head,
                 history,
                 latest,
-                f'history under min_chars '
-                f'({self.min_chars}); not worth the semantic risk',
+                f'only {sum(len(t) for t in payload)} chars to compress, under '
+                f'min_chars ({self.min_chars}); not worth the semantic risk',
             )
             return None
 
-        result = self._compress(history, latest)
+        result = (
+            self._compress(history, latest)
+            if any(text.strip() for text in history)
+            else CompressionResult([''] * len(history))
+        )
         active = self._compress_active(latest)
         combined = _merge(result, active)
         if self.min_saving and combined.rate > 1 - self.min_saving:
@@ -235,6 +246,10 @@ class RestartRefinedContext(Restart):
         # '' means "leave that message as it was", which is what the protected
         # head needs -- and the right thing to do for an entry that compressed
         # down to nothing or was rejected by the validator.
+        # A fallback or a failed tail already recorded why this turn is not
+        # refined; do not overwrite that.
+        if self.failure is None:
+            self.compressed = True
         self._texts = [''] * len(head) + refined + tail
         return self._texts
 
@@ -248,12 +263,35 @@ class RestartRefinedContext(Restart):
         """
         if self.active_compressor is None or not any(t.strip() for t in latest):
             return None
-        return self.active_compressor.compress(latest)
+        try:
+            return self.active_compressor.compress(latest)
+        except Exception as exc:
+            self.compressed = False
+            self.failure = f'{type(exc).__name__}: {exc}'
+            if self.on_error is CompressionFailure.RAISE:
+                raise
+            self._warn(
+                f'Refined context: structured compression of the newest '
+                f'message failed ({self.failure}); keeping it whole. This '
+                f'turn is NOT refined -- exclude it when comparing modes.'
+            )
+            return None
 
     def _split(self, texts: List[str]) -> tuple[List[str], List[str], List[str]]:
-        """Protected head, compressible history, kept-verbatim tail."""
-        first = min(self.keep_first, len(texts))
-        last = min(self.keep_last, len(texts) - first)
+        """Protected head, compressible history, active tail.
+
+        The tail is allocated first. When a node is restarted on its very
+        first turn its whole context is one message -- the plan a Coder was
+        just handed -- and that message is simultaneously the oldest and the
+        newest. It is what the node has to act on, so the tail claims it;
+        giving the head priority instead leaves the tail empty and nothing
+        happens at all, which is what a first-turn restart used to do.
+
+        For any context of two or more messages this is the same split as
+        head-first, so only that degenerate case changes.
+        """
+        last = min(self.keep_last, len(texts))
+        first = min(self.keep_first, len(texts) - last)
         return (
             texts[:first],
             texts[first : len(texts) - last],
