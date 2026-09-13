@@ -22,9 +22,20 @@ LLMLINGUA2_MODEL = 'microsoft/llmlingua-2-xlm-roberta-large-meetingbank'
 LONGLLMLINGUA_MODEL = 'NousResearch/Llama-2-7b-hf'
 
 # Structural characters worth keeping so compressed history stays readable.
-# '.' is deliberately absent: forcing it makes LLMLingua-2 re-join it as its
-# own word, which turns "6.4.6" into "6. 4. 6" and "cpe.go" into "cpe. go".
-STRUCTURAL_FORCE_TOKENS = ['\n', ':', '?', '!']
+#
+# The markdown hashes are here because a plan's own scaffold ("## Fix Plan",
+# "### File path:", "#### Change N:") is the addressing scheme the receiving
+# agent reports against; without them the compressor dissolves the headings
+# and the enumeration goes with them. They are a backstop only -- heading
+# *lines* are held out of the compressor wholesale by HEADING_SPANS, because
+# pinning "####" alone still yields "### # 1:" (measured).
+#
+# '.' is deliberately absent, and this is a considered deviation from the
+# restart spec's shared token guard: forcing it makes LLMLingua-2 re-join it
+# as its own word, which turns "6.4.6" into "6. 4. 6" and "cpe.go" into
+# "cpe. go". Re-measured against the real model on a Planner fix plan before
+# writing this down -- see docs/compression.md.
+STRUCTURAL_FORCE_TOKENS = ['\n', ':', '?', '!', '#', '##', '###', '####', '-', '`']
 
 # Words whose loss inverts a requirement. Token pruning drops function words
 # by design, which turns "must never emit fortios" into "emit fortios" and
@@ -60,6 +71,34 @@ DEFAULT_FORCE_TOKENS = STRUCTURAL_FORCE_TOKENS + NEGATION_FORCE_TOKENS
 # force_tokens, this protection applies in both LLMLingua modes.
 PROTECTED_SPANS = re.compile(r'```[\s\S]*?```|`[^`\n]+`')
 
+# Extensions the benchmark's instances actually contain. The spec's own list
+# is Python-flavoured; SWE-bench-Pro also ships Go, JS/TS and Java repos, and
+# a path is only protected if its extension is recognised.
+SOURCE_EXTENSIONS = (
+    'py|pyi|yaml|yml|json|txt|md|rst|toml|cfg|ini|sh|sql|'
+    'go|mod|js|jsx|ts|tsx|vue|rs|java|kt|rb|php|c|h|cc|cpp|hpp|cs|swift'
+)
+
+# A file path written as bare prose. Protection is by backtick everywhere
+# else in this module, but agents routinely name paths unquoted -- and a
+# pruned path is the worst possible output, because the node calls the file
+# tool with something that looks real and does not exist. Measured at rate
+# 0.33: "lib/ansible/utils/unsafe_proxy.py" came back as "_proxy.py".
+PATH_SPANS = re.compile(rf'(?<![\w/.-])[\w.-]*(?:/[\w.-]+)*\.(?:{SOURCE_EXTENSIONS})\b')
+
+# "line 61", "lines 105-113", "L412". The whole review loop is
+# read_file_segment against exact line numbers, and fine-grained pruning
+# shortens a range to its first half ("lines 87-104" -> "87") even with
+# force_reserve_digit on, because the end of the range is a separate token.
+LINE_REF_SPANS = re.compile(r'\b(?:lines?|L)\s*\d+(?:\s*[-–—]\s*\d+)?', re.IGNORECASE)
+
+# A markdown heading, whole line. "#### Change N:" is the enumeration the
+# receiving agent reports against and "### <path>" is the addressing scheme;
+# both are headers the compressor must not touch. Pinning the hashes in
+# force_tokens is not enough on its own -- measured, "#### Change 1: widen
+# the wrapper set" came back as "### # 1: widen wrapper set".
+HEADING_SPANS = re.compile(r'^[ \t]*#{1,6}[ \t]+[^\n]*', re.MULTILINE)
+
 
 # Words whose loss flips a requirement, for checking a compression after the
 # fact. Wider than NEGATION_FORCE_TOKENS on purpose: force_tokens pin single
@@ -75,6 +114,91 @@ NEGATION_WORDS = re.compile(
 # An XML-ish delimiter, the kind agent prompts wrap their sections in
 # (<pr_description>, </uploaded_files>).
 DELIMITERS = re.compile(r'</?[A-Za-z_][\w.-]*>')
+
+
+# Symbols an agent has already named: a dotted attribute chain, a CamelCase
+# type, a snake_case or dunder function. Harvested from the message itself and
+# pinned for that call only, so the identifiers the plan is *about* survive
+# even where they were written as bare prose rather than in backticks. The
+# shapes are deliberately restricted to names that cannot occur as a fragment
+# of an ordinary English word: LLMLingua-2 implements a multi-token force
+# token as a plain substring replace, so pinning a bare lowercase word would
+# rewrite the middle of unrelated text.
+IDENTIFIER_SHAPES = re.compile(
+    r'\b[A-Za-z_][\w]*(?:\.[A-Za-z_]\w*)+\b'  # pkg.module.attr
+    r'|\b[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)+\b'  # CamelCase
+    r'|\b\w*[a-z0-9]_\w+\b'  # snake_case
+    r'|\b__\w+__\b'  # __all__
+)
+
+#: Hard cap on how many harvested identifiers are pinned. Each force token
+#: costs a pass over the text inside the library, so an unbounded allowlist
+#: turns a cheap guard into the dominant cost on a long plan.
+MAX_HARVESTED_IDENTIFIERS = 64
+
+
+def harvest_identifiers(
+    texts: List[str], limit: int = MAX_HARVESTED_IDENTIFIERS
+) -> List[str]:
+    """The code symbols named in ``texts``, to pin for this call only.
+
+    LLMLingua-2 scores a bare identifier like any other word, so a name the
+    plan is built around ("wrap_var", "AnsibleUnsafeBytes", "__all__") is
+    dropped as readily as a conjunction unless something holds it. Backticked
+    names are already held out by ``PROTECTED_SPANS``; this covers the ones
+    the agent wrote unquoted, which in practice is most of them.
+
+    Longest first, because the library replaces force tokens in order and a
+    short name that is a prefix of a longer one would otherwise claim it.
+    """
+    seen: Dict[str, None] = {}
+    for text in texts:
+        if not text:
+            continue
+        for match in IDENTIFIER_SHAPES.finditer(text):
+            name = match.group()
+            if len(name) >= 3:
+                seen[name] = None
+    return sorted(seen, key=len, reverse=True)[:limit]
+
+
+def unweld(text: str, tokens: List[str]) -> str:
+    """Re-space a pinned token the compressor joined onto the previous word.
+
+    LLMLingua-2 honours a multi-token force token by swapping it for an
+    internal placeholder and mapping it back afterwards. When the word before
+    it is pruned the placeholder ends up welded to whatever now precedes it --
+    "Called" + "describe_available_files" comes back as
+    "Calleddescribe_available_files". The identifier is intact and the meaning
+    survives, but the seam reads as a different symbol than the one that is
+    there, and the next agent greps for symbols.
+
+    Only ever inserts a space, and only where an alphanumeric character butts
+    directly against a pinned name. Tokens are applied longest first so a name
+    that is a suffix of a longer one does not claim it.
+    """
+    for token in sorted(tokens, key=len, reverse=True):
+        if not token or not token[:1].isidentifier() and not token.startswith('_'):
+            continue
+        text = re.sub(rf'(?<=[A-Za-z0-9]){re.escape(token)}', f' {token}', text)
+    return text
+
+
+def guard_control_literals(text: str, literals: List[str], sentinel: str) -> str:
+    """Stop a compressed history block from ending in a routing keyword.
+
+    The workflow's edges match on literal output -- here, a message ending in
+    ``TASK_COMPLETE`` routes to the exit node. A history entry that compresses
+    down to something ending in that keyword is a live hazard: it satisfies a
+    terminal regex without any agent having decided anything. Appending a
+    sentinel line costs nothing and removes the class of failure.
+    """
+    if not literals:
+        return text
+    stripped = text.rstrip()
+    if any(stripped.endswith(literal) for literal in literals):
+        return stripped + '\n' + sentinel
+    return text
 
 
 @dataclass
@@ -97,6 +221,12 @@ class CompressionValidator:
     code_spans: bool = True
     #: A section delimiter present in the original must still be present, whole.
     delimiters: bool = True
+    #: Bare file paths and "line N" / "lines N-M" references must survive
+    #: verbatim. Guaranteed by PATH_SPANS and LINE_REF_SPANS, so like
+    #: code_spans this is a regression check on that guarantee -- and the one
+    #: that catches a halved line range, which is otherwise invisible because
+    #: the truncated version still reads as a valid reference.
+    identifiers: bool = True
 
     def failures(self, original: str, compressed: str) -> List[str]:
         """Every reason this compression should be rejected; empty means fine."""
@@ -105,6 +235,8 @@ class CompressionValidator:
             reasons += self._missing_negations(original, compressed)
         if self.code_spans:
             reasons += self._missing_code_spans(original, compressed)
+        if self.identifiers:
+            reasons += self._missing_identifiers(original, compressed)
         if self.delimiters:
             reasons += self._missing_delimiters(original, compressed)
         return reasons
@@ -129,6 +261,16 @@ class CompressionValidator:
             if span.group() not in compressed
         ]
         return [f'code span {span!r} lost' for span in dict.fromkeys(lost)]
+
+    @staticmethod
+    def _missing_identifiers(original: str, compressed: str) -> List[str]:
+        lost = [
+            span.group()
+            for pattern in (PATH_SPANS, LINE_REF_SPANS)
+            for span in pattern.finditer(original)
+            if span.group() not in compressed
+        ]
+        return [f'reference {span!r} lost' for span in dict.fromkeys(lost)]
 
     @staticmethod
     def _missing_delimiters(original: str, compressed: str) -> List[str]:
@@ -207,6 +349,7 @@ class ContextCompressor:
 
 
 _MODEL_CACHE: Dict[Any, Any] = {}
+_PROTECTED_CACHE: Dict[Any, Any] = {}
 
 
 def _load(model_name: str, use_llmlingua2: bool, device_map: str | None) -> Any:
@@ -309,10 +452,29 @@ class LLMLinguaCompressor(ContextCompressor):
     # control keywords the workflow routes on, report field labels, and so on.
     force_tokens: List[str] = field(default_factory=lambda: list(DEFAULT_FORCE_TOKENS))
     force_reserve_digit: bool = True
-    drop_consecutive: bool = False
+    # Collapse a run of the same forced token. Without it the pinned
+    # structural characters pile up in the output as "\n\n\n:::" once the
+    # words between them are pruned.
+    drop_consecutive: bool = True
     # Keep fenced code blocks and backtick spans out of the compressor.
     # Turn it off only to measure what protection is worth.
     protect_code: bool = True
+    # Keep bare file paths and "line N" / "lines N-M" references out of the
+    # compressor too. Protection by backtick only covers what the agent
+    # happened to quote, and an unquoted path or a halved line range is worse
+    # than a dropped sentence: the node acts on it and is wrong.
+    protect_identifiers: bool = True
+    # Keep whole markdown heading lines out of the compressor. A plan's
+    # headings are its addressing scheme, not prose.
+    protect_headings: bool = True
+    # Symbols to pin for this call. None means harvest them from the text
+    # being compressed (see ``harvest_identifiers``); [] disables the guard.
+    identifier_allowlist: List[str] | None = None
+    # Literal strings held out of the compressor wherever they appear. The
+    # MAS's routing keywords belong here: force_tokens defend them well in
+    # practice, but a dropped keyword misroutes the graph and loses the run,
+    # so they are worth the stronger guarantee.
+    protected_literals: List[str] = field(default_factory=list)
     # Prose runs shorter than this are kept verbatim. Protecting code splits a
     # message into many short fragments -- in a plan dense with backticks most
     # of them are a few words of glue -- and each one costs its own padded
@@ -350,8 +512,18 @@ class LLMLinguaCompressor(ContextCompressor):
             return CompressionResult(entries)
 
         payload = [plans[i][j][1] for i, j in todo]
+        # Harvested from the whole entries, not from the payload: a symbol
+        # written inside a protected code span still has to be pinned where
+        # the surrounding prose names it unquoted.
+        pinned = (
+            self.identifier_allowlist
+            if self.identifier_allowlist is not None
+            else harvest_identifiers(entries)
+            if self.protect_identifiers
+            else []
+        )
         compressed = (
-            self._compress_batch(payload)
+            self._compress_batch(payload, pinned)
             if self.use_llmlingua2
             else self._compress_each(payload, question)
         )
@@ -371,12 +543,17 @@ class LLMLinguaCompressor(ContextCompressor):
         """Cut one entry into alternating [compressible, fragment] pieces."""
         if not text:
             return []
-        if not self.protect_code:
+        pattern = self._protected()
+        if pattern is None:
             return [[True, text]]
 
         pieces: List[List] = []
         at = 0
-        for span in PROTECTED_SPANS.finditer(text):
+        for span in pattern.finditer(text):
+            if span.start() < at:
+                # An inner match of a span already claimed by an outer one
+                # (a path inside a heading, a line ref inside a code block).
+                continue
             if span.start() > at:
                 pieces.append([True, text[at : span.start()]])
             pieces.append([False, span.group()])
@@ -385,21 +562,65 @@ class LLMLinguaCompressor(ContextCompressor):
             pieces.append([True, text[at:]])
         return pieces
 
-    def _compress_batch(self, contexts: List[str]) -> List[str]:
+    def _protected(self) -> 're.Pattern | None':
+        """One alternation over every span kind this compressor holds out.
+
+        Ordered widest first so a fenced block claims the paths and line
+        references inside it rather than being cut apart by them.
+        """
+        key = (
+            self.protect_code,
+            self.protect_identifiers,
+            self.protect_headings,
+            tuple(self.protected_literals),
+        )
+        cached = _PROTECTED_CACHE.get(key)
+        if cached is not None or key in _PROTECTED_CACHE:
+            return cached
+
+        parts = []
+        if self.protect_code:
+            parts.append(PROTECTED_SPANS.pattern)
+        if self.protect_headings:
+            parts.append(HEADING_SPANS.pattern)
+        if self.protect_identifiers:
+            parts += [PATH_SPANS.pattern, LINE_REF_SPANS.pattern]
+        parts += [
+            rf'\b{re.escape(literal)}\b'
+            for literal in sorted(self.protected_literals, key=len, reverse=True)
+        ]
+        pattern = (
+            re.compile(
+                '|'.join(f'(?:{part})' for part in parts),
+                re.MULTILINE | re.IGNORECASE,
+            )
+            if parts
+            else None
+        )
+        _PROTECTED_CACHE[key] = pattern
+        return pattern
+
+    def _compress_batch(
+        self, contexts: List[str], pinned: List[str] | None = None
+    ) -> List[str]:
         # No question here on purpose: compress_prompt drops it before
         # reaching compress_prompt_llmlingua2 (see the class docstring).
+        forced = list(self.force_tokens)
+        forced += [token for token in (pinned or []) if token not in forced]
         result = self._compressor().compress_prompt(
             contexts,
             rate=self.rate,
             target_token=self.target_token,
             # Would drop whole entries and desynchronise the result list.
             use_context_level_filter=False,
-            force_tokens=list(self.force_tokens),
+            force_tokens=forced,
             force_reserve_digit=self.force_reserve_digit,
             drop_consecutive=self.drop_consecutive,
             **self.params,
         )
         texts = result.get('compressed_prompt_list')
+        if texts is not None and pinned:
+            texts = [unweld(text, pinned) for text in texts]
         if texts is None or len(texts) != len(contexts):
             raise RuntimeError(
                 f'{self.model_name} returned '
@@ -461,6 +682,10 @@ class SectionPolicy:
 
     label: str
     rate: float | None = None
+    #: Also lift this section into the pinned resumption state block (Z1),
+    #: under this title. The section stays where it is as well: the block is
+    #: a restatement at the top of the prompt, not a move.
+    pin: str | None = None
 
     @property
     def key(self) -> str:
@@ -469,6 +694,26 @@ class SectionPolicy:
 
 def normalise_label(label: str) -> str:
     return label.strip().rstrip(':').strip().lower()
+
+
+def build_label_pattern(labels: List[str]) -> 're.Pattern | None':
+    """A line-start matcher for ``labels``, longest first.
+
+    Longest first so '## CONCERNS Review' wins over 'CONCERNS'. A markdown
+    heading runs to the end of its line; a field label must be followed by its
+    colon, or a line of ordinary prose that happens to start with the word is
+    mistaken for a section.
+    """
+    if not labels:
+        return None
+    parts = []
+    for label in sorted(labels, key=len, reverse=True):
+        written = re.escape(label.strip().rstrip(':').strip())
+        if label.lstrip().startswith('#'):
+            parts.append(rf'[ \t]*{written}[ \t]*(?=\n|$)')
+        else:
+            parts.append(rf'[ \t]*{written}[ \t]*:[ \t]*')
+    return re.compile('^(?:' + '|'.join(parts) + ')', re.MULTILINE | re.IGNORECASE)
 
 
 @dataclass
@@ -511,21 +756,8 @@ class StructuredCompressor(ContextCompressor):
     def uses_question(self) -> bool:
         return self.template.uses_question
 
-    def _build_pattern(self) -> re.Pattern | None:
-        if not self.sections:
-            return None
-        # Longest first, so '## CONCERNS Review' wins over 'CONCERNS'.
-        parts = []
-        for label in sorted((s.label for s in self.sections), key=len, reverse=True):
-            written = re.escape(label.strip().rstrip(':').strip())
-            if label.lstrip().startswith('#'):
-                # A markdown heading runs to the end of its line.
-                parts.append(rf'[ \t]*{written}[ \t]*(?=\n|$)')
-            else:
-                # A field label must be followed by its colon, or a line of
-                # ordinary prose that happens to start with the word matches.
-                parts.append(rf'[ \t]*{written}[ \t]*:[ \t]*')
-        return re.compile('^(?:' + '|'.join(parts) + ')', re.MULTILINE | re.IGNORECASE)
+    def _build_pattern(self) -> 're.Pattern | None':
+        return build_label_pattern([s.label for s in self.sections])
 
     def compress(self, contexts: List[str], question: str = '') -> CompressionResult:
         entries = [text if isinstance(text, str) else '' for text in contexts]
@@ -540,9 +772,21 @@ class StructuredCompressor(ContextCompressor):
         if not groups:
             return CompressionResult(entries)
 
+        # Harvested once over the whole messages, then pinned on every rate
+        # clone: a symbol named in EDITS has to survive where THOUGHT mentions
+        # it too, and each clone only ever sees its own group's bodies.
+        pinned = (
+            harvest_identifiers(entries)
+            if getattr(self.template, 'protect_identifiers', False)
+            and getattr(self.template, 'identifier_allowlist', None) is None
+            else getattr(self.template, 'identifier_allowlist', None)
+        )
         for rate, coords in groups.items():
             bodies = [plans[i][j][1] for i, j in coords]
-            result = replace(self.template, rate=rate).compress(bodies)
+            clone = replace(self.template, rate=rate)
+            if pinned is not None and hasattr(clone, 'identifier_allowlist'):
+                clone.identifier_allowlist = pinned
+            result = clone.compress(bodies)
             for (i, j), text in zip(coords, result.texts):
                 # '' from the inner compressor means "nothing was changed".
                 if text:
@@ -584,6 +828,14 @@ class StructuredCompressor(ContextCompressor):
                 ]
             )
         return pieces
+
+    def split(self, text: str) -> List[List]:
+        """``[label, body, rate]`` for every section of ``text``, in order.
+
+        Public because the resumption state block reads the same sections
+        this compresses, and the two must agree on where a section starts.
+        """
+        return self._sections(text)
 
     def labels_of(self, text: str) -> List[str]:
         """The labels this compressor recognises in ``text``, in order.

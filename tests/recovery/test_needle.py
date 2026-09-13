@@ -26,6 +26,7 @@ prompts need literals preserved has to quote them or name them in
 """
 
 import os
+import re
 
 import pytest
 
@@ -109,12 +110,99 @@ def needles_are_unique():
         assert HAYSTACK.count(needle) == 1, f'{name} must occur exactly once'
 
 
-@pytest.mark.parametrize('rate', [0.55, 0.4])
+@pytest.mark.parametrize('rate', [0.55, 0.4, 0.33])
 def test_the_configured_rate_keeps_every_needle(rate, needles_are_unique):
-    """The rates an experiment should actually run at."""
+    """The rates an experiment should actually run at.
+
+    0.33 is here because it is the rate the restart spec asks for on the
+    history zone. It used to be below the floor: at 0.25 a line *range* came
+    back halved ("lines 87-104" -> "87"), and 0.33 was too close to that to
+    trust. Line references are now held out of the compressor entirely rather
+    than defended by ``force_reserve_digit``, which is what makes the spec's
+    rate safe to run -- so this asserts it rather than assuming it.
+    """
     survived = _survivors(rate)
     lost = [name for name, kept in survived.items() if not kept]
     assert not lost, f'rate {rate} lost: {lost}'
+
+
+def test_a_bare_line_range_survives_a_rate_that_used_to_halve_it():
+    """The failure this protection exists for, at the rate that produced it."""
+    assert _survivors(0.25)['bare line range']
+    assert _survivors(0.15)['bare line range']
+
+
+BARE = (
+    f'{FILLER}\n\n'
+    'The dispatch in lib/ansible/utils/unsafe_proxy.py at lines 105-113 and '
+    'the export at line 61 both need to move, and the caller in '
+    'lib/ansible/executor/task_executor.py at line 267 stays as it is.\n'
+    '#### Change 1: widen the wrapper set\n'
+    'The helper wrap_var dispatches on the concrete type, so AnsibleUnsafeBytes '
+    'and AnsibleUnsafeText both reach it, and __all__ has to list _wrap_set.\n'
+    f'{FILLER}'
+)
+
+
+@pytest.mark.parametrize('rate', [0.55, 0.33, 0.15])
+def test_unquoted_paths_and_line_refs_survive_any_rate(rate):
+    """Protection by backtick only covers what the agent happened to quote.
+
+    An unquoted path or a halved line range is worse than a dropped sentence:
+    the node calls the file tool with it and is wrong. Measured before this
+    protection existed, at rate 0.33: "lib/ansible/utils/unsafe_proxy.py"
+    came back as "_proxy.py".
+    """
+    out = _compressor(rate).compress([BARE]).texts[0]
+
+    for needle in (
+        'lib/ansible/utils/unsafe_proxy.py',
+        'lib/ansible/executor/task_executor.py',
+        'lines 105-113',
+        'line 61',
+        'line 267',
+    ):
+        assert needle in out, f'{needle} lost at rate {rate}'
+
+
+@pytest.mark.parametrize('rate', [0.55, 0.33, 0.15])
+def test_a_heading_line_survives_whole(rate):
+    """"#### Change N:" is the enumeration the receiving agent reports against.
+
+    Pinning the hashes in force_tokens is not enough on its own -- measured,
+    "#### Change 1: widen the wrapper set" came back as "### # 1: widen".
+    """
+    out = _compressor(rate).compress([BARE]).texts[0]
+    assert '#### Change 1: widen the wrapper set' in out
+
+
+@pytest.mark.parametrize('rate', [0.55, 0.33])
+def test_harvested_identifiers_survive(rate):
+    """Symbols the message names are pinned for that call only.
+
+    LLMLingua-2 scores a bare identifier like any other word, so a name the
+    plan is built around is dropped as readily as a conjunction unless
+    something holds it.
+    """
+    out = _compressor(rate).compress([BARE]).texts[0]
+
+    for needle in ('wrap_var', 'AnsibleUnsafeBytes', 'AnsibleUnsafeText',
+                   '__all__', '_wrap_set'):
+        assert needle in out, f'{needle} lost at rate {rate}'
+
+
+def test_a_pinned_identifier_is_not_welded_to_the_previous_word():
+    """The cost of pinning, and the post-pass that pays it back.
+
+    The library swaps a multi-token force token for a placeholder and maps it
+    back; when the word before it is pruned the placeholder comes back fused
+    to whatever now precedes it.
+    """
+    out = _compressor(0.33).compress([BARE]).texts[0]
+
+    assert 'wrap_var' in out
+    assert not re.search(r'[a-z]wrap_var', out), out
+    assert not re.search(r'[a-z]AnsibleUnsafe', out), out
 
 
 def test_compression_actually_happened():

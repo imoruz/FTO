@@ -471,3 +471,93 @@ class TestFirstTurnRestart:
 
         with pytest.raises(RuntimeError, match='boom'):
             restart.get_context()
+
+
+class TestWhyNotTheLibrarysStructuredPath:
+    """Why this splits the message itself instead of calling upstream.
+
+    LLMLingua ships ``structured_compress_prompt``, which takes a prompt
+    segmented with ``<llmlingua, rate=..., compress=...>`` tags and is the
+    obvious way to give each field its own rate. It is not used here for one
+    measurable reason: it cannot carry ``force_tokens``. It forwards its
+    arguments to ``compress_prompt`` positionally and stops before the token
+    guards, with no ``**kwargs`` to slip them through -- so the negation
+    pinning, the MAS's routing keywords and the harvested identifier
+    allowlist would all be silently dropped on that path, along with
+    ``force_reserve_digit``, which is what holds line numbers together.
+
+    Splitting on the labels here and calling ``compress_prompt`` once per
+    distinct rate gets the same per-field budget with the guards intact.
+
+    This is asserted rather than written down because it is a property of the
+    installed library: if a future version grows the parameter, this test
+    fails and the decision is worth revisiting.
+    """
+
+    def _signature(self):
+        import inspect
+
+        from llmlingua import PromptCompressor
+
+        return inspect.signature(PromptCompressor.structured_compress_prompt)
+
+    @pytest.mark.parametrize(
+        'guard',
+        ['force_tokens', 'force_reserve_digit', 'drop_consecutive', 'chunk_end_tokens'],
+    )
+    def test_the_structured_path_cannot_carry_the_token_guards(self, guard):
+        pytest.importorskip('llmlingua')
+        assert guard not in self._signature().parameters
+
+    def test_and_has_no_kwargs_to_slip_them_through(self):
+        pytest.importorskip('llmlingua')
+        parameters = self._signature().parameters.values()
+        assert not any(p.kind is p.VAR_KEYWORD for p in parameters)
+
+    def test_compress_prompt_does_carry_them(self):
+        """The path actually used. The guards land where they are needed."""
+        pytest.importorskip('llmlingua')
+        import inspect
+
+        from llmlingua import PromptCompressor
+
+        parameters = inspect.signature(PromptCompressor.compress_prompt).parameters
+        for guard in ('force_tokens', 'force_reserve_digit', 'drop_consecutive'):
+            assert guard in parameters
+
+
+class TestIdentifiersArePinnedAcrossSections:
+    """A symbol named in one section is pinned when another is compressed.
+
+    Each rate clone only ever sees its own group's bodies, so harvesting
+    inside the clone would pin a symbol for the section that happens to
+    mention it and drop it everywhere else.
+    """
+
+    def test_the_allowlist_is_harvested_over_the_whole_message(self):
+        from fto.recovery.compression import LLMLinguaCompressor
+
+        seen = {}
+
+        class Recording(LLMLinguaCompressor):
+            def compress(self, contexts, question=''):
+                seen[self.rate] = self.identifier_allowlist
+                return CompressionResult(list(contexts))
+
+        message = (
+            'THOUGHT: the plan asks for a change to the wrapper\n\n'
+            'ACTION: edited it\n\n'
+            'EDITS: widened AnsibleUnsafeBytes in wrap_var\n'
+        )
+        StructuredCompressor(
+            sections=[
+                SectionPolicy('THOUGHT', 0.25),
+                SectionPolicy('ACTION', 0.3),
+                SectionPolicy('EDITS', 0.55),
+            ],
+            template=Recording(),
+        ).compress([message])
+
+        # THOUGHT never mentions either symbol, yet its clone pins both.
+        assert 'AnsibleUnsafeBytes' in seen[0.25]
+        assert 'wrap_var' in seen[0.25]

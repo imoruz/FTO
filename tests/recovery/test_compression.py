@@ -379,12 +379,211 @@ class TestCodeSpanProtection:
         assert '`cpe.go`' in result.texts[0]
 
     def test_protection_can_be_turned_off_for_an_ablation(self, fake_llmlingua):
-        compressor = make_compressor(protect_code=False)
+        compressor = make_compressor(
+            protect_code=False, protect_identifiers=False, protect_headings=False
+        )
 
         compressor.compress(['keep the `cpe.go` path and the `6.4.6` version'])
 
         context, _ = fake_llmlingua.instances[0].calls[0]
         assert context == ['keep the `cpe.go` path and the `6.4.6` version']
+
+    def test_each_kind_of_protection_switches_off_on_its_own(self, fake_llmlingua):
+        # protect_code off still leaves the path held out, because a bare path
+        # is protected by PATH_SPANS rather than by its backticks.
+        make_compressor(protect_code=False, protect_headings=False).compress(
+            ['keep the `cpe.go` path here']
+        )
+        context, _ = fake_llmlingua.instances[0].calls[0]
+        assert 'cpe.go' not in ''.join(context)
+
+
+class TestIdentifierProtection:
+    """Bare paths, line references and headings never reach the model.
+
+    Protection by backtick only covers what the agent happened to quote. An
+    unquoted path or a halved line range is worse than a dropped sentence:
+    the node acts on it and is wrong.
+    """
+
+    def test_a_bare_file_path_is_held_out(self, fake_llmlingua):
+        make_compressor().compress(['edit lib/ansible/utils/unsafe_proxy.py now'])
+
+        context, _ = fake_llmlingua.instances[0].calls[0]
+        assert 'unsafe_proxy.py' not in ''.join(context)
+
+    def test_a_line_range_is_held_out_whole(self, fake_llmlingua):
+        result = make_compressor().compress(
+            ['the wrapper at lines 105-113 and the export at line 61 both move']
+        )
+
+        assert 'lines 105-113' in result.texts[0]
+        assert 'line 61' in result.texts[0]
+
+    def test_a_heading_line_is_held_out_whole(self, fake_llmlingua):
+        result = make_compressor().compress(
+            ['#### Change 1: widen the wrapper set\nsome prose about the change']
+        )
+
+        assert '#### Change 1: widen the wrapper set' in result.texts[0]
+
+    def test_a_path_inside_a_fenced_block_is_claimed_once(self, fake_llmlingua):
+        # The outer span wins; the inner match must not cut the block apart.
+        result = make_compressor().compress(['```\nimport a/b/c.py here\n```'])
+
+        assert result.texts[0] == '```\nimport a/b/c.py here\n```'
+
+
+class TestProtectedLiterals:
+    """The MAS's routing keywords never reach the model at all."""
+
+    def test_a_routing_keyword_is_held_out(self, fake_llmlingua):
+        make_compressor(protected_literals=['TASK_COMPLETE']).compress(
+            ['the planner reviewed every change and then said TASK_COMPLETE']
+        )
+
+        context, _ = fake_llmlingua.instances[0].calls[0]
+        assert 'TASK_COMPLETE' not in ''.join(context)
+
+    def test_it_comes_back_in_place(self, fake_llmlingua):
+        result = make_compressor(protected_literals=['READY_FOR_REVIEW']).compress(
+            ['the coder finished the work and then wrote READY_FOR_REVIEW here']
+        )
+
+        assert 'READY_FOR_REVIEW' in result.texts[0]
+
+    def test_none_configured_is_the_default(self, fake_llmlingua):
+        make_compressor().compress(['a message that mentions TASK_COMPLETE here'])
+
+        context, _ = fake_llmlingua.instances[0].calls[0]
+        assert 'TASK_COMPLETE' in ''.join(context)
+
+
+class TestIdentifierHarvesting:
+    """Symbols the message already names are pinned for that call only."""
+
+    def test_it_finds_the_shapes_that_matter(self):
+        from fto.recovery.compression import harvest_identifiers
+
+        found = harvest_identifiers(
+            ['wrap_var dispatches to AnsibleUnsafeBytes and updates __all__']
+        )
+
+        assert 'wrap_var' in found
+        assert 'AnsibleUnsafeBytes' in found
+        assert '__all__' in found
+
+    def test_it_leaves_ordinary_words_alone(self):
+        from fto.recovery.compression import harvest_identifiers
+
+        # A plain lowercase word pinned as a force token would be substring
+        # replaced through the middle of unrelated text.
+        assert harvest_identifiers(['the wrapper is never reached at all']) == []
+
+    def test_it_is_capped(self):
+        from fto.recovery.compression import harvest_identifiers
+
+        text = ' '.join(f'sym_{i}' for i in range(200))
+        assert len(harvest_identifiers([text], limit=10)) == 10
+
+    def test_longest_first(self):
+        from fto.recovery.compression import harvest_identifiers
+
+        found = harvest_identifiers(['wrap_var and wrap_var_inner both exist'])
+        assert found.index('wrap_var_inner') < found.index('wrap_var')
+
+    def test_harvested_symbols_reach_the_library_as_force_tokens(
+        self, fake_llmlingua
+    ):
+        make_compressor().compress(
+            ['the helper wrap_var dispatches on the concrete type it is handed']
+        )
+
+        _, options = fake_llmlingua.instances[0].calls[0]
+        assert 'wrap_var' in options['force_tokens']
+
+    def test_an_explicit_allowlist_replaces_harvesting(self, fake_llmlingua):
+        make_compressor(identifier_allowlist=['ONLY_THIS']).compress(
+            ['the helper wrap_var dispatches on the concrete type it is handed']
+        )
+
+        _, options = fake_llmlingua.instances[0].calls[0]
+        assert 'ONLY_THIS' in options['force_tokens']
+        assert 'wrap_var' not in options['force_tokens']
+
+
+class TestUnwelding:
+    """A pinned identifier must not come back fused to the previous word."""
+
+    def test_a_welded_identifier_is_re_spaced(self):
+        from fto.recovery.compression import unweld
+
+        assert unweld('Calleddescribe_available_files', ['describe_available_files']) == (
+            'Called describe_available_files'
+        )
+
+    def test_a_legitimate_prefix_is_left_alone(self):
+        from fto.recovery.compression import unweld
+
+        assert unweld('_wrap_var stays', ['wrap_var']) == '_wrap_var stays'
+
+    def test_a_suffix_name_does_not_claim_a_longer_one(self):
+        from fto.recovery.compression import unweld
+
+        out = unweld(
+            'x AnsibleUnsafeBytesAnsibleUnsafeText',
+            ['AnsibleUnsafe', 'AnsibleUnsafeBytes', 'AnsibleUnsafeText'],
+        )
+        assert out == 'x AnsibleUnsafeBytes AnsibleUnsafeText'
+
+    def test_it_only_ever_inserts_a_space(self):
+        from fto.recovery.compression import unweld
+
+        text = 'wrap_var is fine and so is (wrap_var)'
+        assert unweld(text, ['wrap_var']) == text
+
+    def test_it_runs_on_the_compressed_output(self, fake_llmlingua):
+        # The fake echoes its input; the welding happens upstream in the real
+        # library, so this asserts the post-pass is wired in at all.
+        compressor = make_compressor(identifier_allowlist=['wrap_var'])
+        compressor._compressor().__class__.compressed = None
+        result = compressor.compress(
+            ['the helper called wrap_var on each member of the sequence here']
+        )
+        assert 'wrap_var' in result.texts[0]
+
+
+class TestControlLiteralGuard:
+    """A compressed history block must not end in a routing keyword."""
+
+    def test_a_trailing_literal_gets_a_sentinel(self):
+        from fto.recovery.compression import guard_control_literals
+
+        out = guard_control_literals(
+            'we agreed and then TASK_COMPLETE', ['TASK_COMPLETE'], '[history]'
+        )
+        assert out == 'we agreed and then TASK_COMPLETE\n[history]'
+
+    def test_trailing_whitespace_does_not_hide_it(self):
+        from fto.recovery.compression import guard_control_literals
+
+        out = guard_control_literals(
+            'TASK_COMPLETE  \n\n', ['TASK_COMPLETE'], '[history]'
+        )
+        assert out.endswith('[history]')
+
+    def test_a_literal_in_the_middle_is_left_alone(self):
+        from fto.recovery.compression import guard_control_literals
+
+        text = 'TASK_COMPLETE was emitted and then reviewed'
+        assert guard_control_literals(text, ['TASK_COMPLETE'], '[history]') == text
+
+    def test_no_literals_configured_is_a_no_op(self):
+        from fto.recovery.compression import guard_control_literals
+
+        assert guard_control_literals('TASK_COMPLETE', [], '[history]') == (
+            'TASK_COMPLETE'
+        )
 
     def test_token_counts_cover_the_protected_spans(self, fake_llmlingua):
         # The reported ratio is the reduction the node actually sees, not the
@@ -508,17 +707,37 @@ class TestCompressionValidator:
             for f in self._v().failures('```\na b c\n```', '```\na c\n```')
         )
 
+    def test_a_halved_line_range_fails(self):
+        # The truncated form still reads as a valid reference, so only a
+        # comparison with the original can catch it.
+        failures = self._v().failures('the wrapper at lines 87-104', 'wrapper 87')
+        assert any('lines 87-104' in f for f in failures)
+
+    def test_a_pruned_bare_path_fails(self):
+        failures = self._v().failures('edit utils/unsafe_proxy.py', 'edit _proxy.py')
+        assert any('unsafe_proxy.py' in f for f in failures)
+
     def test_each_check_can_be_switched_off(self):
         mangled = ("read `a.go` and do not skip <tag>", 'read `a.` skip')
-        assert self._v(negations=False, code_spans=False, delimiters=False).failures(*mangled) == []
-        assert self._v(negations=True, code_spans=False, delimiters=False).failures(*mangled)
+        assert (
+            self._v(
+                negations=False,
+                code_spans=False,
+                delimiters=False,
+                identifiers=False,
+            ).failures(*mangled)
+            == []
+        )
+        assert self._v(
+            negations=True, code_spans=False, delimiters=False, identifiers=False
+        ).failures(*mangled)
 
     def test_it_reports_every_reason_not_just_the_first(self):
         failures = self._v().failures(
             'do not read `a.go` inside <tag>', 'read `a.` inside'
         )
         kinds = {f.split()[0] for f in failures}
-        assert kinds == {'negation', 'code', 'delimiter'}
+        assert kinds == {'negation', 'code', 'delimiter', 'reference'}
 
     def test_duplicate_reasons_are_reported_once(self):
         failures = self._v().failures('`a.go` `a.go` `a.go`', 'nothing')

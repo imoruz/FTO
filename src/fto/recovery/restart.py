@@ -9,7 +9,9 @@ from fto.recovery.compression import (
     CompressionValidator,
     ContextCompressor,
     LLMLinguaCompressor,
+    guard_control_literals,
 )
+from fto.recovery.resumption import ResumptionPolicy, ResumptionState
 
 if TYPE_CHECKING:
     from fto.adapters.node.node import NodeAdapter
@@ -111,6 +113,9 @@ class RestartRefinedContext(Restart):
         min_chars: int = 0,
         min_saving: float = 0.0,
         active_compressor: ContextCompressor | None = None,
+        resumption: ResumptionPolicy | ResumptionState | None = None,
+        control_literals: List[str] | None = None,
+        history_sentinel: str = '[history]',
     ) -> None:
         super().__init__(restart_count)
         self.compressor = (
@@ -137,6 +142,20 @@ class RestartRefinedContext(Restart):
         # labels* instead -- the scaffold the next agent reads survives, and
         # each field is compressed by what it is worth.
         self.active_compressor = active_compressor
+        # The pinned state block: assumptions, concerns, deviations and the
+        # edit ledger, restated verbatim above the compressed history so a
+        # dropped concern cannot let the loop declare itself finished. None
+        # disables it; a MAS that has no such fields has nothing to pin.
+        self.resumption = (
+            ResumptionState(resumption)
+            if isinstance(resumption, ResumptionPolicy)
+            else resumption
+        )
+        # Keywords the workflow's edges match on. A compressed history entry
+        # that happens to *end* with one satisfies a terminal regex without
+        # any agent having decided anything, so it gets a sentinel line.
+        self.control_literals = list(control_literals or [])
+        self.history_sentinel = history_sentinel
         self.records: List[MessageRecord] = []
         self.logger = logger
         self.on_error = CompressionFailure(on_error)
@@ -147,6 +166,9 @@ class RestartRefinedContext(Restart):
         self.compressed: bool | None = None
         #: Why the history was not compressed, when it was not.
         self.failure: str | None = None
+        #: The pinned state block prepended to this snapshot's context, for
+        #: auditing what the restarted node was actually told.
+        self.pinned_state: str | None = None
         self._texts: List[str] | None = None
 
     def set_context(self, context: Any, adapter: 'NodeAdapter | None' = None) -> None:
@@ -155,6 +177,7 @@ class RestartRefinedContext(Restart):
         self.last_result = None
         self.compressed = None
         self.failure = None
+        self.pinned_state = None
         self.records = []
 
     def get_context(self) -> Any:
@@ -192,23 +215,23 @@ class RestartRefinedContext(Restart):
             payload += [text for text in latest if text.strip()]
 
         if not payload:
-            self._skip(
+            return self._skip(
                 head,
                 history,
                 latest,
+                texts,
                 'nothing to compress outside the protected head'
                 + ('' if self.active_compressor else ' and the verbatim tail'),
             )
-            return None
         if sum(len(text) for text in payload) < self.min_chars:
-            self._skip(
+            return self._skip(
                 head,
                 history,
                 latest,
+                texts,
                 f'only {sum(len(t) for t in payload)} chars to compress, under '
                 f'min_chars ({self.min_chars}); not worth the semantic risk',
             )
-            return None
 
         result = (
             self._compress(history, latest)
@@ -218,15 +241,16 @@ class RestartRefinedContext(Restart):
         active = self._compress_active(latest)
         combined = _merge(result, active)
         if self.min_saving and combined.rate > 1 - self.min_saving:
-            self._skip(
+            skipped = self._skip(
                 head,
                 history,
                 latest,
+                texts,
                 f'saving {1 - combined.rate:.1%} '
                 f'below min_saving ({self.min_saving:.0%})',
             )
             self.last_result = combined
-            return None
+            return skipped
 
         refined, rejected = self._validate(history, result.texts)
         if active is not None:
@@ -250,8 +274,44 @@ class RestartRefinedContext(Restart):
         # refined; do not overwrite that.
         if self.failure is None:
             self.compressed = True
-        self._texts = [''] * len(head) + refined + tail
+
+        refined = [
+            guard_control_literals(text, self.control_literals, self.history_sentinel)
+            if text
+            else text
+            for text in refined
+        ]
+        self._texts = self._with_resumption(
+            [''] * len(head) + refined + tail, texts, len(head)
+        )
         return self._texts
+
+    def _with_resumption(
+        self, refined: List[str], originals: List[str], head: int
+    ) -> List[str]:
+        """Prepend the pinned state block to the first entry after the head.
+
+        The head is the frozen zone -- the task statement, passed through
+        verbatim -- so the block goes immediately after it and before the
+        compressed history, which is where the spec puts it and where a model
+        actually attends to it. Built from ``originals``: the whole point of
+        these fields is that no compressor ever sees them.
+        """
+        if self.resumption is None:
+            return refined
+        block = self.resumption.build(originals)
+        if not block:
+            return refined
+        for index in range(head, len(refined)):
+            current = refined[index] or originals[index]
+            if not current.strip():
+                continue
+            refined[index] = f'{block}\n\n{current}'
+            self.pinned_state = block
+            if index < len(self.records):
+                self.records[index].chars_after = len(refined[index])
+            return refined
+        return refined
 
     def _compress_active(self, latest: List[str]) -> CompressionResult | None:
         """Compress the newest message(s), if a compressor was given for them.
@@ -381,8 +441,21 @@ class RestartRefinedContext(Restart):
         return records
 
     def _skip(
-        self, head: List[str], history: List[str], latest: List[str], why: str
-    ) -> None:
+        self,
+        head: List[str],
+        history: List[str],
+        latest: List[str],
+        originals: List[str],
+        why: str,
+    ) -> List[str] | None:
+        """Record that nothing was compressed, and hand back Z1 if there is one.
+
+        Skipping compression is not a reason to skip the pinned state block.
+        The case where they coincide is the one that most needs the block: a
+        node restarted on its very first turn with the tail kept verbatim has
+        nothing to compress, and without a resumption marker it reads its own
+        pending instruction as a fresh task and starts over.
+        """
         self.compressed = False
         self.failure = why
         self._record(
@@ -395,6 +468,10 @@ class RestartRefinedContext(Restart):
             [[] for _ in latest],
         )
         self._warn(f'Refined context: skipped compression -- {why}.')
+
+        texts = self._with_resumption([''] * len(originals), originals, len(head))
+        self._texts = texts if any(texts) else None
+        return self._texts
 
     def _compress(self, history: List[str], latest: List[str]) -> CompressionResult:
         """Compress the history under the configured failure policy."""

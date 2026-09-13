@@ -725,3 +725,185 @@ class TestRestartRefinedContextAuditRecords:
         restart.set_context(make_context(('user', 'x')), adapter=adapter)
 
         assert restart.records == []
+
+
+class TestControlLiteralGuard:
+    """A compressed history block must not end in a routing keyword.
+
+    The workflow's exit edge matches on literal output. A history entry that
+    compresses down to something ending in TASK_COMPLETE satisfies that regex
+    without any agent having decided anything.
+    """
+
+    def _restart(self, compressed, **kwargs):
+        class Ends(ContextCompressor):
+            def compress(self, contexts, question=''):
+                return CompressionResult([compressed] * len(contexts))
+
+        kwargs.setdefault('control_literals', ['TASK_COMPLETE', 'READY_FOR_REVIEW'])
+        restart = RestartRefinedContext(compressor=Ends(), **kwargs)
+        restart.set_context(
+            make_context(
+                ('user', 'the task'),
+                ('assistant', 'a long earlier plan that says quite a lot'),
+                ('user', 'the newest message'),
+            ),
+            adapter=FakeAdapter(),
+        )
+        return restart
+
+    def test_a_trailing_literal_gets_a_sentinel(self):
+        refined = self._restart('we reviewed it and TASK_COMPLETE').get_context()
+        assert refined[1].text == 'we reviewed it and TASK_COMPLETE\n[history]'
+
+    def test_the_sentinel_is_configurable(self):
+        refined = self._restart(
+            'TASK_COMPLETE', history_sentinel='[earlier turn]'
+        ).get_context()
+        assert refined[1].text.endswith('[earlier turn]')
+
+    def test_a_literal_in_the_middle_is_left_alone(self):
+        text = 'TASK_COMPLETE was emitted then withdrawn again'
+        assert self._restart(text).get_context()[1].text == text
+
+    def test_no_literals_configured_is_a_no_op(self):
+        restart = self._restart('TASK_COMPLETE', control_literals=[])
+        assert restart.get_context()[1].text == 'TASK_COMPLETE'
+
+    def test_the_verbatim_tail_is_not_touched(self):
+        refined = self._restart('TASK_COMPLETE').get_context()
+        assert refined[2].text == 'the newest message'
+
+
+class TestPinnedResumptionState:
+    """The state block sits between the frozen instruction and the history."""
+
+    REPORT = (
+        'EDITS:           `a/one.py` at lines 10-20\n'
+        'PLAN_DEVIATIONS: none\n'
+        'CONCERNS:        the fallback must never be reached\n'
+        'REMAINING: none\n'
+        'READY_FOR_REVIEW'
+    )
+
+    def _policy(self):
+        from fto.recovery.resumption import PinnedField, ResumptionPolicy
+
+        return ResumptionPolicy(
+            fields=[
+                PinnedField('CONCERNS', 'OPEN CONCERNS'),
+                PinnedField('EDITS', 'EDIT LEDGER', ledger=True, latest_only=False),
+            ],
+            boundary_labels=[
+                'EDITS', 'PLAN_DEVIATIONS', 'CONCERNS', 'REMAINING'
+            ],
+            trailing_markers=['READY_FOR_REVIEW'],
+        )
+
+    def _restart(self, messages=None, **kwargs):
+        kwargs.setdefault('resumption', self._policy())
+        restart = RestartRefinedContext(compressor=FakeCompressor(), **kwargs)
+        restart.set_context(
+            make_context(
+                *(
+                    messages
+                    or [
+                        ('user', 'the original issue'),
+                        ('assistant', 'an earlier plan with some prose in it'),
+                        ('user', self.REPORT),
+                    ]
+                )
+            ),
+            adapter=FakeAdapter(),
+        )
+        return restart
+
+    def test_it_lands_after_the_protected_instruction(self):
+        refined = self._restart().get_context()
+
+        assert refined[0].text == 'the original issue'
+        assert refined[1].text.startswith('── RESUMPTION STATE ──')
+
+    def test_the_compressed_history_still_follows_it(self):
+        refined = self._restart().get_context()
+        assert refined[1].text.endswith('<an earlier plan with some prose in it>')
+
+    def test_it_restates_the_fields_verbatim(self):
+        out = self._restart().get_context()[1].text
+
+        assert 'the fallback must never be reached' in out
+        assert 'a/one.py -> lines 10-20' in out
+
+    def test_it_is_built_from_the_snapshot_not_the_compressed_text(self):
+        # FakeCompressor rewrites every entry to '<...>'; the block still
+        # carries the original wording, which is the whole point of Z1.
+        out = self._restart().get_context()[1].text
+        assert 'the fallback must never be reached' in out
+
+    def test_the_tail_is_left_alone(self):
+        refined = self._restart().get_context()
+        assert refined[2].text == self.REPORT
+
+    def test_it_is_recorded_for_auditing(self):
+        restart = self._restart()
+        restart.get_context()
+        assert restart.pinned_state.startswith('── RESUMPTION STATE ──')
+
+    def test_a_first_turn_restart_still_gets_one(self):
+        # One message: it is the tail, and the block goes in front of it.
+        restart = self._restart(
+            [('user', self.REPORT)], active_compressor=ContextCompressor()
+        )
+        assert restart.get_context()[0].text.startswith('── RESUMPTION STATE ──')
+
+    def test_no_policy_means_no_block(self):
+        refined = self._restart(resumption=None).get_context()
+        assert 'RESUMPTION STATE' not in refined[1].text
+
+    def test_a_context_with_no_pinned_fields_gets_no_block(self):
+        restart = self._restart(
+            [
+                ('user', 'the original issue'),
+                ('assistant', 'an earlier plan with some prose in it'),
+                ('user', 'a report with none of the pinned labels in it'),
+            ]
+        )
+        assert 'RESUMPTION STATE' not in restart.get_context()[1].text
+
+    def test_a_skipped_compression_still_gets_the_block(self):
+        """The case that most needs it.
+
+        A node restarted on its very first turn with the tail kept verbatim
+        has nothing to compress. Without a marker it reads its own pending
+        instruction as a fresh task and starts over.
+        """
+        restart = self._restart([('user', self.REPORT)])
+
+        refined = restart.get_context()
+
+        assert restart.compressed is False
+        assert 'nothing to compress' in restart.failure
+        assert refined[0].text.startswith('── RESUMPTION STATE ──')
+        assert refined[0].text.endswith(self.REPORT)
+
+    def test_a_min_saving_skip_still_gets_the_block(self):
+        restart = self._restart(min_saving=0.9)
+
+        refined = restart.get_context()
+
+        assert restart.compressed is False
+        assert 'below min_saving' in restart.failure
+        assert refined[1].text.startswith('── RESUMPTION STATE ──')
+        # The history itself is handed back uncompressed, as a skip means.
+        assert refined[1].text.endswith('an earlier plan with some prose in it')
+
+    def test_a_skip_with_nothing_to_pin_leaves_the_context_alone(self):
+        restart = self._restart([('user', 'no pinned labels in this one')])
+
+        assert restart.get_context() == restart.context
+        assert restart.compressed is False
+
+    def test_the_snapshot_cache_still_replays_the_same_text(self):
+        restart = self._restart()
+        first = restart.get_context()[1].text
+        assert restart.get_context()[1].text == first
