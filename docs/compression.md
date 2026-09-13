@@ -16,7 +16,7 @@ back. There are three answers, and this document is about the third:
 | --- | --- |
 | `RestartAllContext` | everything it saw before, unchanged |
 | `RestartNoContext` | nothing |
-| `RestartRefinedContext` | a **compressed** version of its history, plus its newest message intact |
+| `RestartRefinedContext` | a **compressed** version of its history; its newest message either intact or compressed along its own structure (§5b) |
 
 The point of the middle option is to test a claim: that a restarted agent does
 better with a shorter, cheaper context than with the full transcript — as long
@@ -318,6 +318,111 @@ Faithful token-pruning of a code-heavy agent plan is harder than the ratio
 suggests; see §8 for what that leaves.
 
 
+---
+
+## 5b. Structure-aware compression of the newest message
+
+By default the newest message is handed back whole, because it is what the node
+has to act on. Give the restart an `active_compressor` and it is compressed
+too — but **along its own labels** rather than as one blob.
+
+### Why a blob is the wrong shape
+
+An agent message in a ReAct loop is not prose, it is a form. The Coder's prompt
+tells it to emit exactly these fields, and the Planner's prompt tells it to
+read them by name:
+
+```
+THOUGHT:         what the plan asked for              (restates what it was told)
+ACTION:          what it actually did
+OBSERVATION:     what it saw afterwards
+REPORT:
+  EDITS:           every file and change              (the record)
+  PLAN_DEVIATIONS: what it did differently
+  CONCERNS:        what the plan did not anticipate   (the Planner must rule on these)
+  REMAINING:       what is still outstanding          (gates completion)
+READY_FOR_REVIEW
+```
+
+Compressing that as one blob does two bad things. It applies **one rate to all
+of it**, so a THOUGHT that merely restates the plan is protected as carefully
+as a CONCERNS the reviewing Planner has to adjudicate. And it can dissolve the
+**labels themselves**, at which point the next agent cannot find the fields its
+prompt tells it to read.
+
+### What it does instead
+
+`StructuredCompressor` splits the message on its labels, compresses each body
+at that section's own rate, leaves the labels exactly as written, and puts it
+back in the same order. A section with `rate: null` is passed through
+untouched.
+
+Measured on a real Coder report, 1713 → 1491 characters with the scaffold
+intact:
+
+| section | rate | before | after | |
+| --- | --- | --- | --- | --- |
+| `THOUGHT:` | 0.3 | 280 | 177 | 63% — narration, cheap to lose |
+| `ACTION:` | 0.9 | 164 | 151 | 92% |
+| `OBSERVATION:` | 0.5 | 251 | 174 | 69% |
+| `EDITS:` | 0.9 | 743 | 729 | 98% — the record of what changed |
+| `PLAN_DEVIATIONS:` | 0.9 | 163 | 148 | 91% |
+| `CONCERNS:` | **null** | 6 | 6 | **verbatim** |
+| `REMAINING:` | **null** | 22 | 22 | **verbatim** |
+
+And on a real Planner plan, 8662 → 8310 with all seven of its labels
+(`THOUGHT`, `ACTION`, `OBSERVATION`, `OUTPUT`, `## Analysis`, `## Fix Plan`,
+`## Assumptions & Open Questions`) in place and `THOUGHT` cut to 32%.
+
+### Writing the policy
+
+Labels are matched at the start of a line, case-insensitively, with or without
+their colon — so `'EDITS'` matches the `EDITS:           ` an agent actually
+emits. A field label must be followed by a colon, so a line of prose that
+merely begins with the word is not mistaken for a section. A `## Heading`
+label runs to the end of its line. Longer labels win over shorter ones, so
+`## CONCERNS Review` is not swallowed by `CONCERNS`.
+
+Text the structure does not account for — a preamble before the first label, a
+sub-heading not named in the policy — belongs to the section it sits in.
+`default_rate` covers a message with no labels at all, and `None` (the
+default) keeps such a message verbatim rather than guessing.
+
+```yaml
+restart:
+  mode: refinedcontext
+  keep_last: 1
+  keep_last_verbatim: false      # ← compress the newest message too
+  structure:
+    default_rate: null           # unlabelled text stays verbatim
+    # sections:                  # omit to use the MAS defaults
+    #   - {label: THOUGHT, rate: 0.3}
+    #   - {label: ACTION, rate: 0.9}
+    #   - {label: CONCERNS, rate: null}
+```
+
+Which labels exist and what each is worth is a property of the target MAS's
+prompts, so both live in the experiment config
+(`PLANNER_CODER_SECTIONS` in `FTOexperiments/src/config/fto_config.py`),
+derived from the two role prompts in
+`swe_bench_planner_coder_react.yaml` and confirmed against the labels the
+agents actually emit.
+
+### What still applies
+
+Everything from §5: code spans are protected inside each section, negations
+are pinned, short fragments are left alone, and the result goes through the
+same validator — a structured compression that eats a negation is rejected and
+the original message kept. The reported ratio and `restart.records` cover both
+zones, and the tail's record reads `compressed-structured` so it is
+distinguishable from the history's.
+
+One cost model note: one batched model call per *distinct rate*, not per
+section, so a policy with four rates costs four passes however many labels
+there are. And a section can come back a little *longer in characters* while
+being shorter in tokens — forced punctuation gets re-joined with spaces. The
+ratio is reported in tokens.
+
 ## 6. Keeping messages aligned
 
 The compressor returns **one compressed entry per input entry**, in the same
@@ -569,6 +674,7 @@ restart:
   count: 1
   keep_last: 1          # messages kept verbatim, newest first
   keep_first: 1         # messages held out at the front (the instruction)
+  keep_last_verbatim: true   # false -> compress the tail along its labels (§5b)
   on_error: raise       # raise | passthrough
   min_chars: 0          # skip compression below this much history
   min_saving: 0.0       # discard a compression that saved less than this
@@ -636,3 +742,4 @@ shapes, including keeping attachments in place.
 | Don't try to protect prose by adding characters to `force_tokens` | Tested: recovers nothing, and `*`/`<`/`>` add spacing damage. Use `keep_first`. |
 | Don't read a shorter newest message as truncation | It is the fault payload the snapshot excludes. See §11. |
 | Don't assume a mild ratio means a faithful message | The plan compressed to 94% and still lost a negation. |
+| Don't compress a labelled agent message as one blob | It applies one rate to every field and can dissolve the labels. Use `keep_last_verbatim: false` with a `structure:` policy. |

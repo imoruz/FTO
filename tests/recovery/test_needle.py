@@ -29,7 +29,12 @@ import os
 
 import pytest
 
-from fto.recovery.compression import DEFAULT_FORCE_TOKENS, LLMLinguaCompressor
+from fto.recovery.compression import (
+    DEFAULT_FORCE_TOKENS,
+    LLMLinguaCompressor,
+    SectionPolicy,
+    StructuredCompressor,
+)
 
 pytestmark = pytest.mark.skipif(
     os.environ.get('FTO_NEEDLE_TEST') != '1',
@@ -164,3 +169,91 @@ def test_control_markers_buried_in_a_long_report_survive_too():
         'none',
     ):
         assert marker in compressed, f'{marker} did not survive'
+
+
+# --- structure-aware compression of the newest message ----------------------
+
+PLANNER_CODER_SECTIONS = [
+    SectionPolicy('THOUGHT', 0.3),
+    SectionPolicy('ACTION', 0.9),
+    SectionPolicy('OBSERVATION', 0.5),
+    SectionPolicy('REPORT', 0.9),
+    SectionPolicy('EDITS', 0.9),
+    SectionPolicy('PLAN_DEVIATIONS', 0.9),
+    SectionPolicy('CONCERNS', None),
+    SectionPolicy('REMAINING', None),
+]
+
+CODER_REPORT = (
+    'THOUGHT: The plan asked me to widen the vendor branch so the switch '
+    'family is recognised as well as the router family, and I checked the '
+    'existing helpers still cover what the plan assumed about them.\n\n'
+    'ACTION: Applied the edits with the file tools and re-read each region '
+    'afterwards to confirm the hunks landed where they were meant to.\n\n'
+    'OBSERVATION: All three hunks landed where intended and the surrounding '
+    'code is untouched, and the helper still returns the same shape.\n\n'
+    'REPORT:\n'
+    'EDITS:           `internal/detect/vendorlist.go` at lines 412-418, '
+    'widening the prefix table and adding the switch family mapping.\n'
+    'PLAN_DEVIATIONS: none, the plan was followed exactly as written.\n\n'
+    'CONCERNS:        the fallback path at line 233 must never be reached '
+    'for a switch, because it assumes the router identifier.\n\n'
+    'REMAINING: none\n\n'
+    'READY_FOR_REVIEW'
+)
+
+
+def _structured():
+    return StructuredCompressor(
+        sections=PLANNER_CODER_SECTIONS,
+        template=_compressor(0.55),
+    )
+
+
+def test_the_scaffold_survives_structured_compression():
+    """The next agent's prompt tells it to read these fields by name."""
+    out = _structured().compress([CODER_REPORT]).texts[0]
+
+    assert [label.strip() for label in _structured().labels_of(out)] == [
+        'THOUGHT:', 'ACTION:', 'OBSERVATION:', 'REPORT:',
+        'EDITS:', 'PLAN_DEVIATIONS:', 'CONCERNS:', 'REMAINING:',
+    ]
+
+
+def test_a_verbatim_section_is_byte_identical():
+    out = _structured().compress([CODER_REPORT]).texts[0]
+
+    assert 'the fallback path at line 233 must never be reached' in out
+    assert 'REMAINING: none' in out
+
+
+def test_narration_is_compressed_harder_than_the_record():
+    sc = _structured()
+    before = {label.strip(): body for label, body, _ in sc._sections(CODER_REPORT)}
+    after = {
+        label.strip(): body
+        for label, body, _ in sc._sections(sc.compress([CODER_REPORT]).texts[0])
+    }
+
+    thought = len(after['THOUGHT:']) / len(before['THOUGHT:'])
+    edits = len(after['EDITS:']) / len(before['EDITS:'])
+    assert thought < edits, f'THOUGHT {thought:.0%} should shrink more than EDITS {edits:.0%}'
+
+
+def test_the_message_actually_gets_shorter():
+    result = _structured().compress([CODER_REPORT])
+
+    assert result.compressed_tokens < result.origin_tokens
+    assert len(result.texts[0]) < len(CODER_REPORT)
+
+
+def test_the_terminal_marker_survives():
+    assert 'READY_FOR_REVIEW' in _structured().compress([CODER_REPORT]).texts[0]
+
+
+def test_needles_inside_a_compressed_section_survive():
+    out = _structured().compress([CODER_REPORT]).texts[0]
+
+    assert '`internal/detect/vendorlist.go`' in out   # protected span
+    assert 'lines 412-418' in out                     # digit-bearing
+    assert 'none' in out                              # pinned by force_tokens

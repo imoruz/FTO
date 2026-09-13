@@ -8,6 +8,8 @@ __all__ = [
     'CompressionResult',
     'ContextCompressor',
     'LLMLinguaCompressor',
+    'SectionPolicy',
+    'StructuredCompressor',
     'CompressionFailure',
     'DEFAULT_FORCE_TOKENS',
     'NEGATION_FORCE_TOKENS',
@@ -24,4 +26,6 @@ from .compression import (
     CompressionResult,
     ContextCompressor,
     LLMLinguaCompressor,
+    SectionPolicy,
+    StructuredCompressor,
 )

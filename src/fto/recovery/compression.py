@@ -12,7 +12,7 @@ from, which is what lets roles, sources and attachments survive compression.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Dict, List
 
@@ -443,3 +443,163 @@ class LLMLinguaCompressor(ContextCompressor):
 
     def _compressor(self) -> Any:
         return _load(self.model_name, self.use_llmlingua2, self.device_map)
+
+
+@dataclass
+class SectionPolicy:
+    """How hard to compress one labelled section of a message.
+
+    ``label`` is written as it appears at the start of a line, with or without
+    its colon: ``'THOUGHT'``, ``'EDITS:'``, ``'## Fix Plan'``. Matching
+    ignores case and trailing spaces, so the ``'EDITS:           '`` an agent
+    actually emits still matches ``'EDITS'``.
+
+    ``rate`` is that section's keep-fraction, or None to pass it through
+    untouched -- for a section short and decisive enough that compressing it
+    buys nothing and risks everything.
+    """
+
+    label: str
+    rate: float | None = None
+
+    @property
+    def key(self) -> str:
+        return normalise_label(self.label)
+
+
+def normalise_label(label: str) -> str:
+    return label.strip().rstrip(':').strip().lower()
+
+
+@dataclass
+class StructuredCompressor(ContextCompressor):
+    """Compress a labelled message section by section, keeping its scaffold.
+
+    Agent messages in a ReAct loop are not prose, they are a form: a fixed set
+    of labels whose bodies mean different things and matter to different
+    degrees. A Coder's ``THOUGHT`` restates the plan it was given and is nearly
+    free to lose; its ``CONCERNS`` are the things the reviewing Planner has to
+    adjudicate and must survive whole. Compressing the message as one blob
+    applies one rate to both, and can dissolve the labels themselves -- at
+    which point the next agent cannot find the fields its prompt tells it to
+    read.
+
+    So this splits an entry on its labels, compresses each body at that
+    section's own rate, leaves the labels exactly as written, and puts the
+    message back together in the same order. Unlabelled text -- anything
+    before the first label, and any sub-heading not named in ``sections`` --
+    belongs to the section it sits in and is compressed with it;
+    ``default_rate`` covers a preamble, and None (the default) keeps text the
+    structure does not account for verbatim.
+
+    Which labels exist and what each is worth is a property of the target
+    MAS's prompts, not of fto, so both come from configuration.
+    """
+
+    sections: List[SectionPolicy] = field(default_factory=list)
+    default_rate: float | None = None
+    #: Supplies the model, force_tokens, code protection and fragment floor.
+    #: One clone per distinct rate; they share the loaded model because rate is
+    #: not part of the cache key.
+    template: LLMLinguaCompressor = field(default_factory=LLMLinguaCompressor)
+
+    def __post_init__(self) -> None:
+        self._policies = {s.key: s.rate for s in self.sections}
+        self._pattern = self._build_pattern()
+
+    @property
+    def uses_question(self) -> bool:
+        return self.template.uses_question
+
+    def _build_pattern(self) -> re.Pattern | None:
+        if not self.sections:
+            return None
+        # Longest first, so '## CONCERNS Review' wins over 'CONCERNS'.
+        parts = []
+        for label in sorted((s.label for s in self.sections), key=len, reverse=True):
+            written = re.escape(label.strip().rstrip(':').strip())
+            if label.lstrip().startswith('#'):
+                # A markdown heading runs to the end of its line.
+                parts.append(rf'[ \t]*{written}[ \t]*(?=\n|$)')
+            else:
+                # A field label must be followed by its colon, or a line of
+                # ordinary prose that happens to start with the word matches.
+                parts.append(rf'[ \t]*{written}[ \t]*:[ \t]*')
+        return re.compile('^(?:' + '|'.join(parts) + ')', re.MULTILINE | re.IGNORECASE)
+
+    def compress(self, contexts: List[str], question: str = '') -> CompressionResult:
+        entries = [text if isinstance(text, str) else '' for text in contexts]
+        plans = [self._sections(text) for text in entries]
+
+        # One batched call per distinct rate rather than one per section.
+        groups: Dict[float, List[tuple]] = {}
+        for i, plan in enumerate(plans):
+            for j, (_, body, rate) in enumerate(plan):
+                if rate is not None and body.strip():
+                    groups.setdefault(rate, []).append((i, j))
+        if not groups:
+            return CompressionResult(entries)
+
+        for rate, coords in groups.items():
+            bodies = [plans[i][j][1] for i, j in coords]
+            result = replace(self.template, rate=rate).compress(bodies)
+            for (i, j), text in zip(coords, result.texts):
+                # '' from the inner compressor means "nothing was changed".
+                if text:
+                    plans[i][j][1] = _respace(plans[i][j][1], text)
+
+        texts = [
+            ''.join(label + body for label, body, _ in plan) if plan else ''
+            for plan in plans
+        ]
+        return CompressionResult(
+            texts,
+            origin_tokens=self.template._count(entries),
+            compressed_tokens=self.template._count(texts),
+        )
+
+    def _sections(self, text: str) -> List[List]:
+        """[label, body, rate] triples covering the whole entry, in order."""
+        if not text:
+            return []
+        if self._pattern is None:
+            return [['', text, self.default_rate]]
+
+        matches = list(self._pattern.finditer(text))
+        if not matches:
+            return [['', text, self.default_rate]]
+
+        pieces: List[List] = []
+        if matches[0].start() > 0:
+            pieces.append(['', text[: matches[0].start()], self.default_rate])
+        for k, match in enumerate(matches):
+            end = matches[k + 1].start() if k + 1 < len(matches) else len(text)
+            pieces.append(
+                [
+                    match.group(0),
+                    text[match.end() : end],
+                    self._policies.get(
+                        normalise_label(match.group(0)), self.default_rate
+                    ),
+                ]
+            )
+        return pieces
+
+    def labels_of(self, text: str) -> List[str]:
+        """The labels this compressor recognises in ``text``, in order.
+
+        Exposed so a caller can check a message is the shape it expected
+        before handing it over.
+        """
+        return [label for label, _, _ in self._sections(text) if label]
+
+
+def _respace(original: str, compressed: str) -> str:
+    """Give a compressed body back the leading and trailing whitespace it had.
+
+    The compressor strips both, which would otherwise weld a section onto its
+    label or onto the next label's line.
+    """
+    lead = original[: len(original) - len(original.lstrip())]
+    trail = original[len(original.rstrip()) :]
+    return lead + compressed.strip() + trail

@@ -35,6 +35,19 @@ class MessageRecord:
         return self.chars_before != self.chars_after
 
 
+def _merge(
+    history: CompressionResult, active: CompressionResult | None
+) -> CompressionResult:
+    """One result covering both zones, so the logged ratio is the real one."""
+    if active is None:
+        return history
+    return CompressionResult(
+        history.texts + active.texts,
+        origin_tokens=history.origin_tokens + active.origin_tokens,
+        compressed_tokens=history.compressed_tokens + active.compressed_tokens,
+    )
+
+
 class Restart:
     def __init__(self, restart_count: int = 1) -> None:
         # Maximum number of times a single node may be restarted
@@ -97,6 +110,7 @@ class RestartRefinedContext(Restart):
         validator: CompressionValidator | None = None,
         min_chars: int = 0,
         min_saving: float = 0.0,
+        active_compressor: ContextCompressor | None = None,
     ) -> None:
         super().__init__(restart_count)
         self.compressor = (
@@ -117,6 +131,12 @@ class RestartRefinedContext(Restart):
         # docs/compression.md for the measured case for turning them on.
         self.min_chars = max(0, min_chars)
         self.min_saving = min_saving
+        # What to do with the newest message(s). None keeps them verbatim,
+        # which is the safe default: they are what the node has to act on.
+        # Give it a StructuredCompressor to shrink them *along their own
+        # labels* instead -- the scaffold the next agent reads survives, and
+        # each field is compressed by what it is worth.
+        self.active_compressor = active_compressor
         self.records: List[MessageRecord] = []
         self.logger = logger
         self.on_error = CompressionFailure(on_error)
@@ -184,27 +204,51 @@ class RestartRefinedContext(Restart):
             return None
 
         result = self._compress(history, latest)
-        if self.min_saving and result.rate > 1 - self.min_saving:
+        active = self._compress_active(latest)
+        combined = _merge(result, active)
+        if self.min_saving and combined.rate > 1 - self.min_saving:
             self._skip(
                 head,
                 history,
                 latest,
-                f'saving {1 - result.rate:.1%} '
+                f'saving {1 - combined.rate:.1%} '
                 f'below min_saving ({self.min_saving:.0%})',
             )
-            self.last_result = result
+            self.last_result = combined
             return None
 
-        refined = self._validate(history, result.texts)
-        self.last_result = result
-        self._record(head, history, refined, latest)
-        self._log(result, head=head, history=history, latest=latest)
+        refined, rejected = self._validate(history, result.texts)
+        if active is not None:
+            tail, tail_rejected = self._validate(latest, active.texts)
+        else:
+            tail, tail_rejected = [''] * len(latest), [[] for _ in latest]
+        self.last_result = combined
+        self._record(head, history, refined, rejected, latest, tail, tail_rejected)
+        self._log(
+            combined,
+            head=head,
+            history=history,
+            latest=latest,
+            rejected=rejected + tail_rejected,
+        )
 
-        # '' means "leave that message as it was", which is exactly what the
-        # protected head and the kept-verbatim tail need -- and the right thing
-        # to do for a history entry that compressed down to nothing.
-        self._texts = [''] * len(head) + refined + [''] * len(latest)
+        # '' means "leave that message as it was", which is what the protected
+        # head needs -- and the right thing to do for an entry that compressed
+        # down to nothing or was rejected by the validator.
+        self._texts = [''] * len(head) + refined + tail
         return self._texts
+
+    def _compress_active(self, latest: List[str]) -> CompressionResult | None:
+        """Compress the newest message(s), if a compressor was given for them.
+
+        None means the tail is kept verbatim, which is the default: it is what
+        the node has to act on. A ``StructuredCompressor`` here shrinks it
+        along its own labels instead, so the scaffold the next agent reads
+        stays intact and each field is compressed by what it is worth.
+        """
+        if self.active_compressor is None or not any(t.strip() for t in latest):
+            return None
+        return self.active_compressor.compress(latest)
 
     def _split(self, texts: List[str]) -> tuple[List[str], List[str], List[str]]:
         """Protected head, compressible history, kept-verbatim tail."""
@@ -216,7 +260,9 @@ class RestartRefinedContext(Restart):
             texts[len(texts) - last :],
         )
 
-    def _validate(self, history: List[str], compressed: List[str]) -> List[str]:
+    def _validate(
+        self, originals: List[str], compressed: List[str]
+    ) -> tuple[List[str], List[List[str]]]:
         """Keep the original of any entry the compression mangled.
 
         Fail-closed, per message: one unfaithful entry does not throw away the
@@ -224,14 +270,14 @@ class RestartRefinedContext(Restart):
         rejection rate is measurable rather than invisible.
         """
         kept: List[str] = []
-        self._rejections: List[List[str]] = []
-        for original, text in zip(history, compressed):
+        rejections: List[List[str]] = []
+        for original, text in zip(originals, compressed):
             failures = (
                 self.validator.failures(original, text)
                 if text and text != original
                 else []
             )
-            self._rejections.append(failures)
+            rejections.append(failures)
             if failures:
                 self._warn(
                     f'Refined context: rejected a compressed message and kept '
@@ -240,44 +286,76 @@ class RestartRefinedContext(Restart):
                 kept.append('')
             else:
                 kept.append(text)
-        return kept
+        return kept, rejections
 
     def _record(
         self,
         head: List[str],
         history: List[str],
         refined: List[str],
+        rejected: List[List[str]],
         latest: List[str],
+        tail: List[str],
+        tail_rejected: List[List[str]],
     ) -> None:
-        rejections = getattr(self, '_rejections', [[]] * len(history))
         self.records = [
             MessageRecord(i, 'verbatim-head', len(t), len(t))
             for i, t in enumerate(head)
         ]
-        for j, (original, text) in enumerate(zip(history, refined)):
-            failures = rejections[j]
-            policy = 'rejected' if failures else 'compressed' if text else 'unchanged'
-            self.records.append(
+        self.records += self._zone_records(
+            len(head), history, refined, rejected, 'compressed', 'unchanged'
+        )
+        structured = self.active_compressor is not None
+        self.records += self._zone_records(
+            len(head) + len(history),
+            latest,
+            tail,
+            tail_rejected,
+            'compressed-structured' if structured else 'verbatim-tail',
+            'verbatim-tail',
+        )
+
+    @staticmethod
+    def _zone_records(
+        offset: int,
+        originals: List[str],
+        refined: List[str],
+        rejected: List[List[str]],
+        compressed_policy: str,
+        untouched_policy: str,
+    ) -> List[MessageRecord]:
+        records = []
+        for j, (original, text) in enumerate(zip(originals, refined)):
+            failures = rejected[j] if j < len(rejected) else []
+            if failures:
+                policy = 'rejected'
+            else:
+                policy = compressed_policy if text else untouched_policy
+            records.append(
                 MessageRecord(
-                    len(head) + j,
+                    offset + j,
                     policy,
                     len(original),
                     len(text) if text else len(original),
                     failures,
                 )
             )
-        offset = len(head) + len(history)
-        self.records += [
-            MessageRecord(offset + i, 'verbatim-tail', len(t), len(t))
-            for i, t in enumerate(latest)
-        ]
+        return records
 
     def _skip(
         self, head: List[str], history: List[str], latest: List[str], why: str
     ) -> None:
         self.compressed = False
         self.failure = why
-        self._record(head, history, [''] * len(history), latest)
+        self._record(
+            head,
+            history,
+            [''] * len(history),
+            [[] for _ in history],
+            latest,
+            [''] * len(latest),
+            [[] for _ in latest],
+        )
         self._warn(f'Refined context: skipped compression -- {why}.')
 
     def _compress(self, history: List[str], latest: List[str]) -> CompressionResult:
@@ -323,6 +401,7 @@ class RestartRefinedContext(Restart):
         head: List[str],
         history: List[str],
         latest: List[str],
+        rejected: List[List[str]],
     ) -> None:
         if self.logger is None:
             return
@@ -330,14 +409,22 @@ class RestartRefinedContext(Restart):
         # The rest were never sent (empty, attachment-only, tool protocol) or
         # were rejected by the validator, and counting those as compressed
         # misreads the ratio.
-        rejected = sum(1 for f in getattr(self, '_rejections', []) if f)
-        compressed = sum(1 for text in history if text.strip()) - rejected
+        n_rejected = sum(1 for f in rejected if f)
+        candidates = sum(1 for text in history if text.strip())
+        if self.active_compressor is not None:
+            candidates += sum(1 for text in latest if text.strip())
+        compressed = candidates - n_rejected
         total = len(head) + len(history) + len(latest)
+        tail = (
+            f'last {len(latest)} compressed along its structure'
+            if self.active_compressor is not None
+            else f'last {len(latest)} kept verbatim'
+        )
         conditioned = getattr(self.compressor, 'uses_question', False)
         self.logger.info(
             f'Refined context: compressed {compressed} of {total} message(s), '
             f'{result.describe()}; first {len(head)} kept as instruction, '
-            f'last {len(latest)} kept verbatim'
-            + (f', {rejected} rejected by the validator' if rejected else '')
+            f'{tail}'
+            + (f', {n_rejected} rejected by the validator' if n_rejected else '')
             + f'; question-conditioned: {conditioned}.'
         )
