@@ -1,0 +1,6 @@
+line-length = 88
+
+[format]
+quote-style = "single"
+indent-style = "space"
+line-ending = "auto"
