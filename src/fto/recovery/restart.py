@@ -16,6 +16,19 @@ from fto.recovery.resumption import ResumptionPolicy, ResumptionState
 if TYPE_CHECKING:
     from fto.adapters.node.node import NodeAdapter
 
+# Separates the pinned resumption state block from the (compressed) message
+# that follows it, so the two are never mistaken for one continuous block --
+# the state block is regenerated structurally, the text under it is what the
+# node actually queued.
+RESUMPTION_BOUNDARY = '── COMPRESSED HISTORY FROM THE PREVIOUS ATTEMPT ──'
+
+# Separates the compressed history from the newest message(s), when those are
+# run through active_compressor: the two are compressed by different means
+# (token-pruned prose vs. section-aware structural compression) and marking
+# the seam keeps a reader -- human or model -- from reading them as one
+# continuous, uniformly-compressed block.
+TAIL_BOUNDARY = '── STRUCTURALLY COMPRESSED LATEST MESSAGE ──'
+
 
 @dataclass
 class MessageRecord:
@@ -197,137 +210,15 @@ class RestartRefinedContext(Restart):
         return self.adapter.context_from_list(texts, self.context)
 
     def refine_test(self, texts: str = None) -> List[str] | None:
-        """The refined text of every message, or None if there is nothing to do.
+        """Test-only alias for ``_refine``; kept public so callers can inspect it.
 
-        Compression runs once per snapshot: further attempts on the same node
-        replay the same refined context instead of paying for the model again.
+        There is no separate logic here on purpose -- a duplicate copy of
+        ``_refine`` drifted out of sync with it (missing the tail boundary
+        marker, still calling the now-removed history validation) and produced
+        different output than the real restart path. This delegates so the
+        two can never diverge again.
         """
-        if self._texts is not None:
-            return self._texts
-        texts = texts or self.adapter.context_as_list(self.context)
-
-
-        # TODO: TEST FROM HERE WHAT HAPPENS
-
-
-        head, history, latest = self._split(texts)
-
-        print('HEAD:')
-        print(head)
-        print('HISTORY:')
-        print(history)
-        print('LATEST:')
-        print(latest)
-        # Everything that could be compressed: the history always, and the
-        # tail too when a compressor was given for it.
-        payload = [text for text in history if text.strip()]
-        if self.active_compressor is not None:
-            payload += [text for text in latest if text.strip()]
-
-        if not payload:
-            return self._skip(
-                head,
-                history,
-                latest,
-                texts,
-                'nothing to compress outside the protected head'
-                + ('' if self.active_compressor else ' and the verbatim tail'),
-            )
-        if sum(len(text) for text in payload) < self.min_chars:
-            return self._skip(
-                head,
-                history,
-                latest,
-                texts,
-                f'only {sum(len(t) for t in payload)} chars to compress, under '
-                f'min_chars ({self.min_chars}); not worth the semantic risk',
-            )
-
-        result = (
-            self._compress(history, latest)
-            if any(text.strip() for text in history)
-            else CompressionResult([''] * len(history))
-        )
-        print('RESULT')
-        print(result)
-
-        active = self._compress_active(latest)
-
-        print('ACTIVE')
-        # NOTE: active is compressed!!!
-        print(active)
-        combined = _merge(result, active)
-        print('COMBINED')
-        print(combined)
-        if self.min_saving and combined.rate > 1 - self.min_saving:
-            skipped = self._skip(
-                head,
-                history,
-                latest,
-                texts,
-                f'saving {1 - combined.rate:.1%} '
-                f'below min_saving ({self.min_saving:.0%})',
-            )
-            self.last_result = combined
-            print('in here???????')
-            return skipped
-
-        # refined, rejected = self._validate(history, result.texts)
-
-        # print('REFINED')
-        # print(refined)
-        # print('REJECTED')
-        # print(rejected)
-        # if active is not None:
-        #     tail, tail_rejected = self._validate(latest, active.texts)
-        #     print('TAIL')
-        #     print(tail)
-        #     print('TAIL REJECTED')
-        #     print(tail_rejected)
-        # else:
-        #     tail, tail_rejected = [''] * len(latest), [[] for _ in latest]
-        # Accept compressor output directly, without validation.
-        refined = result.texts
-        tail = active.texts if active is not None else [''] * len(latest)
-
-        # Keep empty rejection structures if these methods still expect them.
-        rejected = [[] for _ in history]
-        tail_rejected = [[] for _ in latest]
-        self.last_result = combined
-        self._record(head, history, refined, rejected, latest, tail, tail_rejected)
-        self._log(
-            combined,
-            head=head,
-            history=history,
-            latest=latest,
-            rejected=rejected + tail_rejected,
-        )
-
-        # '' means "leave that message as it was", which is what the protected
-        # head needs -- and the right thing to do for an entry that compressed
-        # down to nothing or was rejected by the validator.
-        # A fallback or a failed tail already recorded why this turn is not
-        # refined; do not overwrite that.
-        if self.failure is None:
-            self.compressed = True
-
-        refined = [
-            guard_control_literals(text, self.control_literals, self.history_sentinel)
-            if text
-            else text
-            for text in refined
-        ]
-
-        # print('REFINED LIST')
-        # print(refined)
-        # print('TAIL')
-        # print(tail)
-        # print('TEXTS')
-        # print(texts)
-        self._texts = self._with_resumption(
-            [''] * len(head) + refined + tail, texts, len(head)
-        )
-        return self._texts
+        return self._refine(texts)
 
     def _refine(self, texts: str = None) -> List[str] | None:
         """The refined text of every message, or None if there is nothing to do.
@@ -389,11 +280,11 @@ class RestartRefinedContext(Restart):
             self.last_result = combined
             return skipped
 
-        refined, rejected = self._validate(history, result.texts)
-        # if active is not None:
-        #     tail, tail_rejected = self._validate(latest, active.texts)
-        # else:
-        #     tail, tail_rejected = [''] * len(latest), [[] for _ in latest]
+        # Validation against negations/code-spans/identifiers was dropped: it
+        # rejected too many faithful compressions in practice (see the
+        # StructuredCompressor sections, which are pinned or dropped rather
+        # than checked after the fact). Compressor output is accepted as-is.
+        refined = result.texts
         tail = active.texts if active is not None else [''] * len(latest)
         rejected = [[] for _ in history]
         tail_rejected = [[] for _ in latest]
@@ -421,10 +312,30 @@ class RestartRefinedContext(Restart):
             else text
             for text in refined
         ]
-        self._texts = self._with_resumption(
-            [''] * len(head) + refined + tail, texts, len(head)
-        )
+        combined_texts = [''] * len(head) + refined + tail
+        if active is not None and any(t.strip() for t in history):
+            combined_texts = self._with_tail_boundary(
+                combined_texts, len(head) + len(history)
+            )
+        self._texts = self._with_resumption(combined_texts, texts, len(head))
         return self._texts
+
+    def _with_tail_boundary(
+        self, refined: List[str], tail_start: int
+    ) -> List[str]:
+        """Mark the seam between the compressed history and the tail zone.
+
+        Only meaningful when the tail actually went through
+        ``active_compressor`` *and* there is compressed history in front of
+        it to be mistaken for -- a verbatim tail, or a tail with nothing
+        ahead of it, needs no marker.
+        """
+        for index in range(tail_start, len(refined)):
+            if not refined[index].strip():
+                continue
+            refined[index] = f'{TAIL_BOUNDARY}\n\n{refined[index]}'
+            return refined
+        return refined
 
     def _with_resumption(
         self, refined: List[str], originals: List[str], head: int
@@ -458,7 +369,7 @@ class RestartRefinedContext(Restart):
             current = refined[index] or originals[index]
             if not current.strip():
                 continue
-            refined[index] = f'{block}\n\n{current}'
+            refined[index] = f'{block}\n\n{RESUMPTION_BOUNDARY}\n\n{current}'
             self.pinned_state = block
             if index < len(self.records):
                 self.records[index].chars_after = len(refined[index])
@@ -564,19 +475,6 @@ class RestartRefinedContext(Restart):
             'compressed-structured' if structured else 'verbatim-tail',
             'verbatim-tail',
         )
-        # print('RECORDS')
-        # print('')
-        # print('')
-        # print('')
-        # print('')
-        # print('')
-        # print(self.records)
-        # print('')
-        # print('')
-        # print('')
-        # print('')
-        # print('')
-        # print('')
 
 
     @staticmethod

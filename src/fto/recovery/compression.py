@@ -682,6 +682,12 @@ class SectionPolicy:
 
     label: str
     rate: float | None = None
+    #: Remove the section entirely -- label and body both -- instead of
+    #: compressing it. For a section that is pure ritual (a THOUGHT that only
+    #: restates the plan it was handed) even a hard compression rate leaves a
+    #: label with nothing under it; this drops the whole block so the next
+    #: agent never sees it. Takes priority over ``rate`` when both are set.
+    drop: bool = False
     #: Also lift this section into the pinned resumption state block (Z1),
     #: under this title. By default the section stays where it is as well:
     #: the block is a restatement at the top of the prompt, not a move.
@@ -698,6 +704,11 @@ class SectionPolicy:
     @property
     def key(self) -> str:
         return normalise_label(self.label)
+
+
+# Marks a section's [label, body, rate] slot for wholesale removal, distinct
+# from both a real rate and from None ("pass through untouched").
+_DROPPED = object()
 
 
 def normalise_label(label: str) -> str:
@@ -757,7 +768,9 @@ class StructuredCompressor(ContextCompressor):
     template: LLMLinguaCompressor = field(default_factory=LLMLinguaCompressor)
 
     def __post_init__(self) -> None:
-        self._policies = {s.key: s.rate for s in self.sections}
+        self._policies = {
+            s.key: (_DROPPED if s.drop else s.rate) for s in self.sections
+        }
         self._pattern = self._build_pattern()
 
     @property
@@ -771,13 +784,24 @@ class StructuredCompressor(ContextCompressor):
         entries = [text if isinstance(text, str) else '' for text in contexts]
         plans = [self._sections(text) for text in entries]
 
+        # A dropped section loses its label too -- it is not compressed, it
+        # is gone -- so it is cleared before batching, not sent through
+        # LLMLingua at some rate.
+        dropped = False
+        for plan in plans:
+            for piece in plan:
+                if piece[2] is _DROPPED:
+                    piece[0] = ''
+                    piece[1] = ''
+                    dropped = True
+
         # One batched call per distinct rate rather than one per section.
         groups: Dict[float, List[tuple]] = {}
         for i, plan in enumerate(plans):
             for j, (_, body, rate) in enumerate(plan):
-                if rate is not None and body.strip():
+                if rate is not None and rate is not _DROPPED and body.strip():
                     groups.setdefault(rate, []).append((i, j))
-        if not groups:
+        if not groups and not dropped:
             return CompressionResult(entries)
 
         # Harvested once over the whole messages, then pinned on every rate
