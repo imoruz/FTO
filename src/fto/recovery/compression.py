@@ -136,6 +136,24 @@ IDENTIFIER_SHAPES = re.compile(
 #: turns a cheap guard into the dominant cost on a long plan.
 MAX_HARVESTED_IDENTIFIERS = 64
 
+#: llmlingua allocates exactly this many `[NEWi]` placeholder tokens when the
+#: model loads (see PromptCompressor.init_llmlingua2) and asserts
+#: len(force_tokens) <= this at compress time. Not configurable per call, so
+#: anything that adds to force_tokens has to share this budget with whatever
+#: the caller already pinned.
+LLMLINGUA_MAX_FORCE_TOKENS = 100
+
+
+def harvested_identifier_budget(force_tokens: List[str]) -> int:
+    """How many identifiers ``harvest_identifiers`` may add on top of ``force_tokens``.
+
+    Keeps ``len(force_tokens) + len(pinned) <= LLMLINGUA_MAX_FORCE_TOKENS`` no
+    matter how many fixed force tokens a given MAS config already carries,
+    instead of relying on ``MAX_HARVESTED_IDENTIFIERS`` alone staying small
+    enough for whatever force_tokens list happens to be active.
+    """
+    return max(0, min(MAX_HARVESTED_IDENTIFIERS, LLMLINGUA_MAX_FORCE_TOKENS - len(force_tokens)))
+
 
 def harvest_identifiers(
     texts: List[str], limit: int = MAX_HARVESTED_IDENTIFIERS
@@ -518,7 +536,9 @@ class LLMLinguaCompressor(ContextCompressor):
         pinned = (
             self.identifier_allowlist
             if self.identifier_allowlist is not None
-            else harvest_identifiers(entries)
+            else harvest_identifiers(
+                entries, limit=harvested_identifier_budget(self.force_tokens)
+            )
             if self.protect_identifiers
             else []
         )
@@ -808,7 +828,12 @@ class StructuredCompressor(ContextCompressor):
         # clone: a symbol named in EDITS has to survive where THOUGHT mentions
         # it too, and each clone only ever sees its own group's bodies.
         pinned = (
-            harvest_identifiers(entries)
+            harvest_identifiers(
+                entries,
+                limit=harvested_identifier_budget(
+                    getattr(self.template, 'force_tokens', [])
+                ),
+            )
             if getattr(self.template, 'protect_identifiers', False)
             and getattr(self.template, 'identifier_allowlist', None) is None
             else getattr(self.template, 'identifier_allowlist', None)
