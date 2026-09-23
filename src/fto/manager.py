@@ -236,6 +236,8 @@ class Manager:
         node invocation."""
         max_restarts = getattr(self.restart, 'restart_count', 1)
         result = None
+        self.restart.set_idx(self.idx_step)
+        self.restart.set_diff(self.checkpoint.diff(self.idx_step, adapter.id))
         for attempt in range(1, max_restarts + 1):
             # Only the attempt that runs last may reach the successors, so
             # drop the edges the previous one produced.

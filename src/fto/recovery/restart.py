@@ -1,5 +1,6 @@
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, List
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, List
 
 from dataclasses import dataclass, field
 
@@ -79,6 +80,12 @@ class Restart:
         """
         self.context = deepcopy(context)
         self.adapter = adapter
+
+    def set_diff(self, diff_path: Path | None) -> None:
+        pass
+
+    def set_idx(self, idx: int) -> None:
+        self.idx = idx
 
     def get_context(self) -> Any:
         pass
@@ -476,7 +483,6 @@ class RestartRefinedContext(Restart):
             'verbatim-tail',
         )
 
-
     @staticmethod
     def _zone_records(
         offset: int,
@@ -607,3 +613,31 @@ class RestartRefinedContext(Restart):
             + (f', {n_rejected} rejected by the validator' if n_rejected else '')
             + f'; question-conditioned: {conditioned}.'
         )
+
+
+class RestartWithDiff(Restart):
+    def __init__(self, restart_count: int = 1, build_diff_message: Callable | None = None) -> None:
+        super().__init__(restart_count)
+        self.no_diff_note = "No changes were made to the repository yet."
+        self.build_diff_message = build_diff_message
+
+    def set_diff(self, diff_path: Path | None) -> None:
+        self.diff_path = diff_path
+
+    def get_context(self) -> Any:
+        if not self.context:
+            return None
+        if not self.adapter:
+            raise ValueError('RestartWithDiff needs the node adapter to read the prior context')
+        texts = self.adapter.context_as_list(self.context)
+        message = self.build_diff_message(self.idx, texts)
+        message += (
+            f"\nThe diff of previously made changes is available at: {self.diff_path}"
+            if self.diff_path
+            else self.no_diff_note
+        )
+        return self.adapter.context_from_list([message], self.context)
+
+    def _merge_history(self, texts):
+        pass
+        

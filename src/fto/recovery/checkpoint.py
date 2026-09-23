@@ -1,5 +1,7 @@
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 
 _FTO_EXCLUDE_PATTERNS = [
@@ -26,6 +28,8 @@ class Checkpoint:
     def restore(self, node_id: str) -> None:
         pass
 
+    def diff(self, idx: int, node_id: str) -> None:
+        pass
 
 class GitBranchCheckpoint(Checkpoint):
     def __init__(self, repo_path: Path, run_id: str) -> None:
@@ -111,3 +115,20 @@ class GitBranchCheckpoint(Checkpoint):
 
     def restore(self, node_id: str) -> None:
         self._git('restore', '--source', self._ref(node_id), '--worktree', '--', ':/')
+
+    def diff(self, idx: int, node_id: str) -> Path | None:
+        if idx is not None and idx > 4:
+            raise ValueError(
+                f'idx_step {idx} is not supported; the injection index '
+                f'cannot be higher than 4.'
+            )
+        ref = self._ref(node_id) if idx == 4 else self.baseline_ref
+        result = self._git('diff', ref)
+        if not result.stdout.strip():
+            return None
+        fd, path = tempfile.mkstemp(
+            prefix=f'{self.branch_prefix}-diff-', suffix='.patch'
+        )
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(result.stdout)
+        return Path(path)
