@@ -12,7 +12,14 @@ _FTO_EXCLUDE_PATTERNS = [
     'workflow_summary.yaml',
     'token_usage_*.json',
     'traces.jsonl',
+    '.fto/',
 ]
+
+# Diff files live under the repo's own worktree rather than the system temp
+# dir: a restarted node's file tools resolve paths inside the workspace the
+# MAS sandbox gives them, not arbitrary absolute paths like /tmp/*, so a diff
+# handed back as an out-of-tree path is one the node can never actually open.
+_DIFF_SUBDIR = Path('.fto') / 'diffs'
 
 
 class Checkpoint:
@@ -126,9 +133,11 @@ class GitBranchCheckpoint(Checkpoint):
         result = self._git('diff', ref)
         if not result.stdout.strip():
             return None
+        diff_dir = self.repo_path / _DIFF_SUBDIR
+        diff_dir.mkdir(parents=True, exist_ok=True)
         fd, path = tempfile.mkstemp(
-            prefix=f'{self.branch_prefix}-diff-', suffix='.patch'
+            prefix=f'{self.branch_prefix}-diff-', suffix='.patch', dir=diff_dir
         )
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(result.stdout)
-        return Path(path)
+        return Path(path).relative_to(self.repo_path)
