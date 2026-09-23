@@ -630,12 +630,7 @@ class RestartWithDiff(Restart):
         if not self.adapter:
             raise ValueError('RestartWithDiff needs the node adapter to read the prior context')
         texts = self.adapter.context_as_list(self.context)
-        message = self.build_diff_message(self.idx, texts)
-        message += (
-            f"\nThe diff of previously made changes is available at: {self.diff_path}"
-            if self.diff_path
-            else self.no_diff_note
-        )
+        message = self.build_diff_message(self.idx, texts, self.diff_path)
         return self.adapter.context_from_list([message], self.context)
 
     def _merge_history(self, texts):
