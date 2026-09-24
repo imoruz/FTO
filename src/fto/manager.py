@@ -244,18 +244,25 @@ class Manager:
             self._reset_edge(token, *args, **kwargs)
             if self.checkpoint:
                 self.checkpoint.restore(node_id=adapter.id)
-            adapter.set_input(self.restart.get_context())
+            injected_context = self.restart.get_context()
+            adapter.set_input(injected_context)
             self.logger.info(
                 f'Restarting {adapter.id} with {type(self.restart).__name__} '
                 f'(attempt {attempt}/{max_restarts}).',
                 node_id=adapter.id,
             )
             if not self.observer:
-                return callable(*args, **kwargs)
+                result = callable(*args, **kwargs)
+                self.restart.restore_input(adapter, injected_context)
+                return result
 
             # Observer set: re-run under observation and re-evaluate.
             allow_eager = not (attempt == max_restarts)
             result, faults = self._observe(callable, adapter, allow_eager=allow_eager, *args, **kwargs)
+            # Undo a one-shot context override (see Restart.restore_input)
+            # before the node's transcript grows any further, on this
+            # attempt's result or the next attempt's -- whichever comes.
+            self.restart.restore_input(adapter, injected_context)
             if faults:
                 self._report_faults(faults, adapter)
 

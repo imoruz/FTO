@@ -92,6 +92,21 @@ class Restart:
     def get_context(self) -> Any:
         pass
 
+    def restore_input(self, adapter: 'NodeAdapter', injected_context: Any) -> None:
+        """Undo a one-time context override once the retried execution has run.
+
+        A no-op by default: most modes mean ``get_context()``'s result to
+        become the node's new *permanent* history -- that's the whole point
+        of a reset (``RestartAllContext``) or a compressed history
+        (``RestartRefinedContext``), and the node's transcript is meant to
+        keep building on top of it. Only a mode whose context is a one-shot
+        engineered message for a single retried call (``RestartWithDiff``,
+        ``RestartWithDiffSections``) needs to splice that message back out
+        afterward, or it becomes a permanent, stale fixture of every future
+        turn -- see ``Manager._restart``, which calls this after each attempt.
+        """
+        pass
+
 
 class RestartAllContext(Restart):
     def __init__(self, restart_count: int = 1) -> None:
@@ -635,6 +650,26 @@ class RestartWithDiff(Restart):
         message = self.build_diff_message(self.idx, texts, self.diff_path)
         return self.adapter.context_from_list([message], self.context)
 
+    def restore_input(self, adapter: 'NodeAdapter', injected_context: Any) -> None:
+        """Splice the one-shot engineered message back out after the retry.
+
+        ``get_context()`` collapses the node's whole history into a single
+        message meant only to steer the one retried call this triggers --
+        not to become the node's history from here on. Left in place, it
+        sits at the head of an ever-growing, never-pruned transcript
+        (``context_window: -1``) and gets replayed verbatim on every future
+        turn, so a Coder restarted once keeps being told to inspect an
+        overlay diff long after that restart is over. This restores the
+        real pre-fault history (``self.context``, snapshotted before the
+        fault ran) and keeps only what this execution actually appended
+        after the synthetic message.
+        """
+        if not self.context:
+            return
+        injected_len = len(injected_context) if injected_context else 0
+        appended = list(adapter.input or [])[injected_len:]
+        adapter.set_input(list(self.context) + appended)
+
     def _merge_history(self, texts):
         pass
 
@@ -659,3 +694,18 @@ class RestartWithDiffSections(Restart):
         filtered = [keep_labelled_sections(t, self._pattern) for t in texts]
         message = self.build_diff_message(self.idx, filtered, self.diff_path)
         return self.adapter.context_from_list([message], self.context)
+
+    def restore_input(self, adapter: 'NodeAdapter', injected_context: Any) -> None:
+        """Splice the one-shot engineered message back out after the retry.
+
+        Same reasoning as ``RestartWithDiff.restore_input`` -- the message
+        ``get_context()`` returns is a one-time nudge for the retried call,
+        not a replacement for the node's real history. Without this, it sits
+        at the head of an ever-growing, never-pruned transcript
+        (``context_window: -1``) and gets replayed on every future turn.
+        """
+        if not self.context:
+            return
+        injected_len = len(injected_context) if injected_context else 0
+        appended = list(adapter.input or [])[injected_len:]
+        adapter.set_input(list(self.context) + appended)
