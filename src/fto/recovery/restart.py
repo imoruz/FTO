@@ -11,6 +11,8 @@ from fto.recovery.compression import (
     ContextCompressor,
     LLMLinguaCompressor,
     guard_control_literals,
+    keep_labelled_sections,
+    build_label_pattern
 )
 from fto.recovery.resumption import ResumptionPolicy, ResumptionState
 
@@ -635,4 +637,25 @@ class RestartWithDiff(Restart):
 
     def _merge_history(self, texts):
         pass
-        
+
+
+class RestartWithDiffSections(Restart):
+    def __init__(self, restart_count: int = 1, build_diff_message: Callable | None = None, keep_labels: List[str] | None = None) -> None:
+        super().__init__(restart_count)
+        self.no_diff_note = "No changes were made to the repository yet."
+        self.build_diff_message = build_diff_message
+        self.keep_labels = keep_labels
+        self._pattern = build_label_pattern(self.keep_labels)
+
+    def set_diff(self, diff_path: Path | None) -> None:
+        self.diff_path = diff_path
+
+    def get_context(self) -> Any:
+        if not self.context:
+            return None
+        if not self.adapter:
+            raise ValueError('RestartWithDiff needs the node adapter to read the prior context')
+        texts = self.adapter.context_as_list(self.context)
+        filtered = [keep_labelled_sections(t, self._pattern) for t in texts]
+        message = self.build_diff_message(self.idx, filtered, self.diff_path)
+        return self.adapter.context_from_list([message], self.context)

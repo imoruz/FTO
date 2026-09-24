@@ -4,6 +4,7 @@ __all__ = [
     'RestartAllContext',
     'RestartRefinedContext',
     'RestartWithDiff',
+    'RestartWithDiffSections',
     'Checkpoint',
     'GitBranchCheckpoint',
     'CompressionResult',
@@ -23,7 +24,7 @@ __all__ = [
     'STRUCTURAL_FORCE_TOKENS',
 ]
 
-from .restart import Restart, RestartNoContext, RestartAllContext, RestartRefinedContext, RestartWithDiff
+from .restart import Restart, RestartNoContext, RestartAllContext, RestartRefinedContext, RestartWithDiff, RestartWithDiffSections
 from .checkpoint import Checkpoint, GitBranchCheckpoint
 from .compression import (
     DEFAULT_FORCE_TOKENS,

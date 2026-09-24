@@ -755,6 +755,27 @@ def build_label_pattern(labels: List[str]) -> 're.Pattern | None':
     return re.compile('^(?:' + '|'.join(parts) + ')', re.MULTILINE | re.IGNORECASE)
 
 
+def keep_labelled_sections(text: str, pattern: 're.Pattern | None') -> str:
+    """Only the sections `pattern` matches, label and body verbatim, in order.
+
+    Unlike `StructuredCompressor`, nothing surviving is rewritten -- a
+    kept section is exactly what was written. Everything not matched
+    (unlabelled preamble, any section not in `pattern`) is dropped outright,
+    not compressed down to something smaller. Used where the point is to
+    isolate a decision an agent already made (its OUTPUT, its REPORT) from
+    the narration around it, rather than to shrink the narration.
+    """
+    if not text or pattern is None:
+        return ''
+    matches = list(pattern.finditer(text))
+    if not matches:
+        return ''
+    pieces = []
+    for k, match in enumerate(matches):
+        end = matches[k + 1].start() if k + 1 < len(matches) else len(text)
+        pieces.append(text[match.start():end])
+    return ''.join(pieces)
+
 @dataclass
 class StructuredCompressor(ContextCompressor):
     """Compress a labelled message section by section, keeping its scaffold.
