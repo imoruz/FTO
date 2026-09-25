@@ -648,7 +648,7 @@ class RestartWithDiff(Restart):
             raise ValueError('RestartWithDiff needs the node adapter to read the prior context')
         texts = self.adapter.context_as_list(self.context)
         message = self.build_diff_message(self.idx, texts, self.diff_path)
-        return self.adapter.context_from_list([message], self.context)
+        return self.adapter.context_collapsed(message, self.context)
 
     def restore_input(self, adapter: 'NodeAdapter', injected_context: Any) -> None:
         """Splice the one-shot engineered message back out after the retry.
@@ -693,7 +693,7 @@ class RestartWithDiffSections(Restart):
         texts = self.adapter.context_as_list(self.context)
         filtered = [keep_labelled_sections(t, self._pattern) for t in texts]
         message = self.build_diff_message(self.idx, filtered, self.diff_path)
-        return self.adapter.context_from_list([message], self.context)
+        return self.adapter.context_collapsed(message, self.context)
 
     def restore_input(self, adapter: 'NodeAdapter', injected_context: Any) -> None:
         """Splice the one-shot engineered message back out after the retry.

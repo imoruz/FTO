@@ -112,3 +112,16 @@ class NodeAdapter:
         which is what keeps the rebuilt list valid to send to a provider.
         """
         pass
+
+    def context_collapsed(self, text: str, context: Any = None) -> Any:
+        """One new message carrying ``text``, replacing ``context`` wholesale.
+
+        Unlike ``context_from_list``, this does not require one text per
+        original message -- a caller collapsing many messages into a single
+        engineered one (e.g. ``RestartWithDiff``) has no way to satisfy that
+        one-to-one contract, and needs the result to be a *shorter* list, not
+        a same-length rewrite. The single message keeps the role/metadata of
+        ``context``'s last entry, which is what keeps it valid to send to a
+        provider. Returns ``[]`` if ``context`` is empty.
+        """
+        pass

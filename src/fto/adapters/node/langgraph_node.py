@@ -69,6 +69,12 @@ class LangGraphNodeAdapter(NodeAdapter):
             for message, text in zip(messages, texts)
         ]
 
+    def context_collapsed(self, text: str, context: Any = None) -> Any:
+        messages = list((self.input if context is None else context) or [])
+        if not messages:
+            return []
+        return [_message_with_text(messages[-1], text) if text else messages[-1]]
+
 
 def _message_text(message: Any) -> str:
     # A tool call or its result is half of a pair the provider matches up;
