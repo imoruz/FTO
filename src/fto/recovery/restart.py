@@ -647,6 +647,15 @@ class RestartWithDiff(Restart):
         if not self.adapter:
             raise ValueError('RestartWithDiff needs the node adapter to read the prior context')
         texts = self.adapter.context_as_list(self.context)
+        # A turn that used any tools spans several messages, not one: every
+        # intermediate tool-call round is blanked to '' by context_as_list
+        # (it must not rewrite a tool-call/tool-result pairing), and only the
+        # one message that ended the turn without calling another tool
+        # carries the turn's real text. build_diff_message indexes by fixed
+        # position (texts[0]/[1]/[2] = task/plan/report); dropping the blanks
+        # here is what makes those positions line up with "one real message
+        # per turn" regardless of how many tool rounds any given turn took.
+        texts = [text for text in texts if text]
         message = self.build_diff_message(self.idx, texts, self.diff_path)
         return self.adapter.context_collapsed(message, self.context)
 
@@ -691,6 +700,11 @@ class RestartWithDiffSections(Restart):
         if not self.adapter:
             raise ValueError('RestartWithDiff needs the node adapter to read the prior context')
         texts = self.adapter.context_as_list(self.context)
+        # See RestartWithDiff.get_context: drop the blanks context_as_list
+        # leaves for a turn's intermediate tool-call rounds, so the fixed
+        # positions build_diff_message indexes by (texts[0]/[1]/[2]) line up
+        # with one real message per turn.
+        texts = [text for text in texts if text]
         filtered = [keep_labelled_sections(t, self._pattern) for t in texts]
         message = self.build_diff_message(self.idx, filtered, self.diff_path)
         return self.adapter.context_collapsed(message, self.context)
