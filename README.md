@@ -132,16 +132,95 @@ fault = OTelFault(
 Control what context is passed to the restarted node.
 
 ```python
-from fto.recovery import RestartAllContext, RestartNoContext, RestartRefinedContext
+from fto.recovery import (
+    RestartAllContext,
+    RestartNoContext,
+    RestartRefinedContext,
+    RestartWithDiff,
+    RestartWithDiffSections,
+)
 
 restart = RestartAllContext()      # re-run with full original input
 restart = RestartNoContext()       # re-run with no context
 restart = RestartRefinedContext()  # re-run with the history compressed
+restart = RestartRefinedContext(active_compressor=structured)  # ...structurally compressed
+restart = RestartWithDiff(build_diff_message=build)            # re-run with edits preserved
+restart = RestartWithDiffSections(build_diff_message=build, keep_labels=['OUTPUT', 'REPORT'])
 ```
+
+| strategy | what the restarted node sees |
+| --- | --- |
+| `RestartAllContext` | the full original input |
+| `RestartNoContext` | no context |
+| `RestartRefinedContext` | head and tail verbatim, history token-pruned, pinned state restated |
+| `RestartRefinedContext` + `active_compressor` | as above, but the newest message is compressed **along its own labels** ([details](#restart-with-structurally-compressed-context)) |
+| `RestartWithDiff` | the history collapsed into one message, plus a pointer to a diff of the edits made so far ([details](#restart-with-edits-preserved)) |
+| `RestartWithDiffSections` | like `RestartWithDiff`, but each message reduced to its `keep_labels` sections |
 
 Whichever strategy is configured, the context handed back is the snapshot taken
 *before* the fault was injected, never whatever the fault left in the node's
 input.
+
+### Restart with structurally compressed context
+
+`RestartRefinedContext` compresses the history as flat prose. Pass an
+`active_compressor` (a `StructuredCompressor`) and the newest message is
+compressed *structurally* too: it is split along its labels (`THOUGHT`,
+`ACTION`, `OBSERVATION`, `EDITS`, `CONCERNS`, `REMAINING`, ...), and each
+section is compressed at its own rate, or kept verbatim with `None`. The
+scaffold the next agent reads survives; only the narration of past turns is
+squeezed. The compressed tail is set off from the history by a
+`── STRUCTURALLY COMPRESSED LATEST MESSAGE ──` marker, and a pinned state block
+(open assumptions, concerns, plan deviations, the edit ledger) is regenerated
+from the snapshot above it when a `resumption` policy is given.
+
+```python
+from fto.recovery import (
+    LLMLinguaCompressor, RestartRefinedContext, SectionPolicy, StructuredCompressor,
+)
+
+compressor = LLMLinguaCompressor(rate=0.55)
+structured = StructuredCompressor(
+    sections=[
+        SectionPolicy('THOUGHT', 0.3),
+        SectionPolicy('EDITS', 0.9),
+        SectionPolicy('CONCERNS', None),   # verbatim
+    ],
+    template=compressor,
+)
+restart = RestartRefinedContext(compressor=compressor, active_compressor=structured)
+```
+
+See [Refined context](#refined-context) and [docs/compression.md](docs/compression.md)
+for the full mechanism, rate selection and gotchas.
+
+### Restart with edits preserved
+
+`RestartWithDiff` and `RestartWithDiffSections` keep the work the node already
+did to the repository. Before each restart the `Manager` asks the checkpoint for
+a diff of the edits made so far (`Checkpoint.diff`) and hands its path to the
+strategy (`set_diff`). `build_diff_message(idx, texts, diff_path)` turns the
+prior messages and that diff into a single message, which replaces the node's
+history for the retried call only. Afterwards the real pre-fault history is
+restored (plus whatever the retry appended), so the one-shot message is never
+replayed on later turns.
+
+```python
+from fto.recovery import RestartWithDiff, RestartWithDiffSections
+
+def build(idx, texts, diff_path):
+    diff = f"Your earlier edits are in {diff_path}." if diff_path else "No changes were made yet."
+    return "\n\n".join([*texts, diff])
+
+restart = RestartWithDiff(build_diff_message=build)
+
+# Same, but each prior message is reduced to its OUTPUT / REPORT sections
+restart = RestartWithDiffSections(build_diff_message=build, keep_labels=['OUTPUT', 'REPORT'])
+```
+
+Empty messages (the intermediate tool-call rounds) are dropped before
+`build_diff_message` is called, so `texts` holds one real message per turn.
+The node adapter must implement `context_as_list` and `context_collapsed`.
 
 ### Refined context
 
