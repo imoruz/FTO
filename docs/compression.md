@@ -1,0 +1,1134 @@
+# Context Compression — How Restart With Refined Context Works
+
+> Covers `src/fto/recovery/compression.py` and the compression half of
+> `src/fto/recovery/restart.py`. Written to be readable without knowing
+> LLMLingua; the numbers in it are measured, not estimated, and come from real
+> Planner/Coder runs on SWE-bench-Pro instances.
+
+---
+
+## 1. What this is for
+
+When FTO restarts a faulty agent node, it has to decide what context to hand
+back. There are three answers, and this document is about the third:
+
+| Mode | What the restarted node sees |
+| --- | --- |
+| `RestartAllContext` | everything it saw before, unchanged |
+| `RestartNoContext` | nothing |
+| `RestartRefinedContext` | a **compressed** version of its history; its newest message either intact or compressed along its own structure (§5b); and a pinned state block above both (§5c) |
+
+A refined context is not a chat log, it is a reinstantiation prompt, and it
+has four zones rather than two:
+
+| Zone | Contents | Policy |
+| --- | --- | --- |
+| **Z0 — frozen** | the agent's role block; the original task statement | never compressed (`keep_first`) |
+| **Z1 — pinned state** | resumption marker, assumptions, concerns, deviations, edit ledger | regenerated structurally, no model call (§5c) |
+| **Z2 — older messages** | `messages[0 .. n-2]` | LLMLingua-2 at `rate` |
+| **Z3 — newest message** | `messages[n-1]` | verbatim, or structure-aware (§5b) |
+
+Z1 at the top and Z3 at the bottom is deliberate: the two load-bearing blocks
+sit at the two positions a model attends to most, rather than in the middle.
+
+The point of the middle option is to test a claim: that a restarted agent does
+better with a shorter, cheaper context than with the full transcript — as long
+as the short version still says the same thing. Compression is how we make the
+context shorter. Most of this document is about the "still says the same
+thing" part, because that is where it goes wrong.
+
+---
+
+## 2. The one rule
+
+> **Compress the middle of the history. Protect both ends.**
+
+Two kinds of message are held out:
+
+- **The newest message** is what the node has to act on *right now* — the plan
+  it must implement, or the review it must answer. `keep_last` (default 1,
+  never less than 1).
+- **The oldest message** is instruction-like — the task statement for a
+  planner, the original plan for a coder. `keep_first` (default 1, 0 to
+  disable).
+
+A worked example. The Planner is restarted on a review turn:
+
+```
+[0]  the task specification        →  PROTECTED  (it is the instruction)
+[1]  its own earlier plan          →  compressed
+[2]  the Coder's report            →  compressed
+[3]  the Coder's newest report     →  VERBATIM   ← what it has to answer
+```
+
+### Why the front is protected too
+
+Because instructions are the content token pruning damages worst, and the
+original design compressed them hardest. Measured on a real run: of a
+17-message context, the task specification was compressed **more aggressively
+than anything else** (to 62% of its length, 108 edit operations), because it is
+prose while the plan is half code and code is protected. Protection was
+*redirecting* the damage onto the instruction.
+
+What that cost, verbatim from the run:
+
+| written in the task spec | came back as |
+| --- | --- |
+| `DON'T have to modify the testing logic` | `'T modify testing logic` |
+| `not rely on implicit zero values` | `not rely values` |
+| `**Current Behavior:**` and `**Expected Behavior:**` | both → `Behavior` |
+| `</uploaded_files>` | deleted |
+
+The third row is the worst: the bug state and the target state become
+indistinguishable. With `keep_first=1` all four survive intact.
+
+> This mirrors LLMLingua's own guidance [\[2\]][llmlingua] — its
+> `compress_prompt` has separate
+> `context`, `instruction` and `question` parameters precisely because
+> instructions and questions are compression-sensitive while documents are
+> not. FTO cannot know which message is "the instruction" in a general MAS, so
+> it protects the oldest, which is the closest MAS-agnostic proxy.
+
+**Adding structural characters to `force_tokens` does not fix this** — I tried
+it. Pinning `*`, `<`, `>` and apostrophe contractions recovered **zero** of
+the six lost phrases and introduced the same space-insertion artefact that
+makes `.` unusable (`< tag`, `tag >`). `force_tokens` preserves *tokens*;
+the damage here is the surrounding *words* being dropped, which no token
+pinning can express. Not compressing the instruction is the fix.
+
+---
+
+## 3. How the pieces fit together
+
+Four layers, each with one job:
+
+```
+Manager                snapshots the node's input BEFORE the fault is injected
+  │                    (manager.py: snapshot() → restart.set_context())
+  ▼
+RestartRefinedContext  splits history from the newest message,
+  │                    decides policy, remembers the result
+  ▼
+NodeAdapter            translates MAS messages ⇄ plain text
+  │                    (context_as_list / context_from_list)
+  ▼
+ContextCompressor      shrinks plain text
+                       (LLMLinguaCompressor, or your own)
+```
+
+Two properties of this split matter:
+
+**The compressor never sees a message object.** It takes a list of strings and
+returns a list of strings. That is why nothing in it knows or cares whether
+the MAS is ChatDev or LangGraph.
+
+**The compressor never sees the newest message.** Splitting history from the
+active message is the restart layer's job, done before `compress()` is called.
+If you ever call the compressor yourself, that exclusion is on you.
+
+### What gets snapshotted
+
+The manager takes the snapshot *before* the fault is applied, so the refined
+context is built from the pristine input — not from whatever the fault left
+behind. In a real run we confirmed this: a fault had rewritten the Coder's
+report from 1572 to 1713 characters, and the restarted Planner received the
+original 1572-character version, byte for byte.
+
+---
+
+## 4. What LLMLingua-2 actually does
+
+This is the mental model that prevents most surprises.
+
+**It is not a summarizer.** It does not rewrite, rephrase, or explain. It is a
+small BERT-sized classifier that looks at each token and predicts "keep" or
+"drop", then deletes the drops. The words that come out are a subset of the
+words that went in, in the same order.
+
+LLMLingua-2 [\[3\]][llmlingua2] formulates compression as token
+classification and distils the labels from GPT-4, which is what makes it
+faithful — the output is guaranteed to be a subsequence of the input — and
+what makes it task-agnostic.
+
+**And it was trained on meeting transcripts.** Both released checkpoints
+(`llmlingua-2-xlm-roberta-large-meetingbank`, `llmlingua-2-bert-base-`
+`multilingual-cased-meetingbank`) are distilled on MeetingBank. Go source,
+XML-delimited agent prompts and API contracts are well out of that domain, so
+treat compression quality on code-bearing text as **unvalidated** — which is
+why the safety nets and the needle gate carry the weight here rather than
+trust in the scorer. Upstream ships training scripts if you ever want a
+checkpoint distilled on your own agent transcripts.
+
+So this:
+
+> The relevant implementation is in `contrib/snmp2cpe/pkg/cpe/cpe.go`, and the
+> `Convert` function switches on `detectVendor(result)` at line 17.
+
+becomes something like:
+
+> relevant implementation `contrib/snmp2cpe/pkg/cpe/cpe.go` `Convert` switches
+> `detectVendor(result)` line 17
+
+Grammar is the first thing to go, because grammar is the most predictable part
+of a sentence. That is usually fine — an LLM reads the second version
+correctly.
+
+**The failure mode is that it drops small words.** And some small words carry
+the entire meaning of a sentence. That is the subject of the next section.
+
+### `rate` is the fraction you keep
+
+`rate=0.55` means "keep about 55% of the tokens". Lower is more aggressive.
+(The upstream docs also mention a `ratio` parameter where larger means fewer
+tokens; the installed API uses `rate`, and it is the keep-fraction.)
+
+---
+
+## 5. The safety nets
+
+Without these, compression produces text that is not merely shorter — it is
+*wrong in ways that look right*. All of them are on by default. The first
+three try to prevent damage; the fourth checks afterwards whether they
+succeeded. §5c is the fifth and the different one: it does not make
+compression safer, it keeps the fields the loop's correctness depends on out
+of the compressor's reach entirely.
+
+### 5.1 protected spans — code, paths, line numbers and headings never reach the model
+
+Anything inside backticks, or inside a fenced code block (triple backticks), is
+cut out of the message before compression, held aside, and put back exactly
+where it was. The model only ever sees the prose between the code.
+
+Why this is not optional — measured on a real Planner plan, compressed without
+protection:
+
+| written | came back as |
+| --- | --- |
+| `` `cpe.go` `` | `` `cpe.` `` |
+| `cpe:2.3:h:fortinet:%s` | `:2.:fortinet:::::::::` |
+| `6.4.6` | `6. 4. 6` |
+| `strings.Fields(...)` | `strings.` |
+| `util.Unique(cpes)` | *(gone)* |
+
+Every one of those is worse than deleting the sentence outright. A restarted
+Planner told to read `contrib/snmp2cpe/pkg/cpe/cpe.` will call the file tool
+with a path that does not exist. `:2.:fortinet:` is not a CPE string; it is
+noise shaped like one.
+
+With protection on, the same plan keeps **31 of 31** code literals.
+
+**Backticks are not enough on their own.** Agents write most of their paths
+and line numbers unquoted, and an unquoted reference is scored like any other
+words. Three more span kinds are therefore held out, on the same mechanism:
+
+| pattern | what it holds | measured without it, at `rate` 0.33 |
+| --- | --- | --- |
+| `PATH_SPANS` | a bare file path, for the extensions the benchmark actually contains | `lib/ansible/utils/unsafe_proxy.py` → `_proxy.py` |
+| `LINE_REF_SPANS` | `line 61`, `lines 105-113`, `L412` | `lines 87-104` → `87` — a range halved into something that still reads as a valid reference |
+| `HEADING_SPANS` | a whole markdown heading line | `#### Change 1: widen the wrapper set` → `### # 1: widen wrapper set` |
+
+The last row is why headings are protected as *spans* rather than defended
+with `force_tokens`: pinning `#`, `##`, `###` and `####` was tried first and
+still produced `### # 1:`. The hashes stay in `DEFAULT_FORCE_TOKENS` as a
+backstop, but they are not what saves a heading.
+
+This is also what changed the usable rate. `force_reserve_digit` keeps a
+number from being rewritten, but the *end* of a range is a separate token, so
+it was still droppable; the needle gate put the floor at 0.4 for that reason.
+With ranges held out of the compressor entirely the gate now passes at 0.33,
+0.25 and 0.15, and the configured history rate is 0.33 (§12).
+
+**The limit that remains:** a literal of a shape none of these patterns know —
+`cpe:2.3:o:fortinet` — is still scored like prose, and came back as `:2.3` in
+a real plan. Quote it or add it to `force_tokens`; don't rely on the digit
+heuristic.
+
+### 5.2 `force_tokens` — words that must not be dropped
+
+A list of strings the compressor is told never to remove. Two groups ship by
+default, plus whatever your MAS adds.
+
+**Negations.** Dropping "not" halves a sentence's length and inverts its
+meaning. Real examples from an uncompressed-negation run:
+
+| original | compressed | effect |
+| --- | --- | --- |
+| "`FortiSwitch` **must never** produce `fortios`; **only** fortigate and fortiwifi should map OS to `fortios`" | "`FortiSwitch` produce `fortios` `fortigate` `fortiwifi` map OS to `fortios`" | **says the opposite** |
+| "**Do not** require `build`" | "require `build`" | **inverted** |
+| "**No changes** to tests" | "changes tests" | **inverted** |
+| "the minimal fix **should not** cover every product line" | "minimal fix cover every product line" | **inverted** |
+
+`NEGATION_FORCE_TOKENS` pins `not`, `no`, `none`, `never`, `only`, `must`,
+`cannot`, `without`, `except`, `unless` — and their capitalised forms, because
+matching is case-sensitive and these words start sentences. With them pinned,
+the same plan keeps **17 of 17** negations.
+
+`none` deserves its own mention: `CONCERNS: none` and `CONCERNS:` mean
+opposite things to a reviewing Planner.
+
+**Structure.** `\n`, `:`, `?`, `!` keep the shape of a report readable.
+
+**Harvested identifiers.** Pinning is not only for a fixed list. Before each
+call the symbols the message already names are harvested out of it and pinned
+for that call only — dotted attribute chains, CamelCase types, snake_case and
+dunder names. On the Ansible instance that yields `wrap_var`, `_wrap_set`,
+`AnsibleUnsafeBytes`, `AnsibleUnsafeText`, `__all__`, `binary_type`, and the
+tool names the agent narrated calling. Without it, a bare identifier is scored
+like any other word and `AnsibleUnsafeBytes` simply disappears.
+
+Only shapes that cannot occur inside an ordinary English word are harvested,
+and the list is capped at 64. Both limits are about the mechanism described
+in the box below: a force token is substring-replaced through the text, so
+pinning a plain lowercase word would rewrite the middle of unrelated prose.
+
+The cost is a seam. The library swaps a multi-token force token for a
+placeholder and maps it back afterwards, so when the word before it is pruned
+the identifier comes back fused to whatever now precedes it —
+`Calleddescribe_available_files`. `unweld()` runs over the output and puts the
+space back. It only ever *inserts* a space, and only where an alphanumeric
+character butts directly against a pinned name, so `_wrap_var` is left alone.
+
+**`drop_consecutive` is on**, unlike the library default. Without it the
+pinned structural characters pile up in the output as runs of `\n\n\n:::`
+once the words between them are pruned.
+
+**`.` is deliberately NOT forced.** Forcing it makes LLMLingua-2 treat it as
+its own word and re-join it with spaces, which turns `6.4.6` into `6. 4. 6`
+and `cpe.go` into `cpe. go`. This was a real bug; don't add it back.
+
+**MAS-specific markers** belong to the experiment, not to FTO — the routing
+keywords and report labels a particular workflow depends on. For Planner/Coder
+that is `TASK_COMPLETE`, `READY_FOR_REVIEW`, `EDITS`, `PLAN_DEVIATIONS`,
+`CONCERNS`, `REMAINING`, and the section headings. They live in
+`FTOexperiments/src/config/fto_config.py`, and they **extend**
+`DEFAULT_FORCE_TOKENS` rather than replacing it — replacing it silently drops
+the negation protection, which is exactly what happened in one run.
+
+<details>
+<summary>A mechanism worth knowing about (checked, not currently a problem)</summary>
+
+LLMLingua-2 handles a multi-token `force_tokens` entry by replacing it
+throughout the text with an internal placeholder token, then mapping it back
+afterwards. The replacement is a plain substring replace, so in principle
+forcing `ACTION` also rewrites the middle of `TRANSACTION`.
+
+Tested: `TRANSACTION`, `REACTION` and `INTERACTION` all survive intact with
+`ACTION` forced, and across 237 KB of real Planner/Coder traffic there are
+zero genuine collisions. No action needed — but if you add a short force token
+that happens to tokenize into pieces, this is the failure mode to look for.
+</details>
+
+### 5.3 `min_fragment_chars` — don't compress scraps
+
+Protecting code has a side effect: it chops a message into alternating prose
+and code pieces. A plan dense with backticks fragments a lot. In one real
+context, 6 messages became **102 prose fragments, 83 of them under 80
+characters** — things like `" and "`, `" at lines "`, `" → "`.
+
+Compressing a four-word scrap saves nothing and costs a full model pass.
+`min_fragment_chars=80` keeps anything shorter verbatim. It cut compression
+time on that context from **12.5s to 2.7s** with no measurable quality loss.
+
+This threshold is also what keeps a short standalone message intact — a
+history entry that is just `TASK_COMPLETE` (13 characters) is passed through
+untouched.
+
+> **Careful:** the threshold protects short *fragments*, not markers wherever
+> they appear. `READY_FOR_REVIEW` at the end of a 1572-character report is
+> inside a long fragment and *is* compressed — what saves it there is
+> `force_tokens`, not the threshold. Both mechanisms are needed; neither
+> substitutes for the other.
+
+---
+
+### 5.4 `CompressionValidator` — check, don't hope
+
+The first three nets are preventive, and none of them can notice when they
+were insufficient. So every compressed message is compared against its
+original before being accepted, and a message that fails is **rejected — the
+original is kept instead**. Fail-closed, per message, so one bad entry does
+not throw away the compression of the others.
+
+Three checks, all objective string comparisons:
+
+| check | catches |
+| --- | --- |
+| **negations** | any of `not`/`no`/`none`/`never`/`neither`/`nor`/`without`/`except`/`unless`/`cannot`/`nil`/`null` and the apostrophe contractions (`don't`, `won't`, `isn't`, …) occurring fewer times than in the original |
+| **code spans** | a backticked span or fenced block that did not survive verbatim — a regression check on `PROTECTED_SPANS` |
+| **identifiers** | a bare file path or a `line N` / `lines N-M` reference that did not survive verbatim — a regression check on `PATH_SPANS` and `LINE_REF_SPANS`, and the one that catches a halved range, which is otherwise invisible because the truncated form still reads as a valid reference |
+| **delimiters** | a `<tag>` present in the original and missing from the output, or a fenced block left unbalanced |
+
+The negation check is what covers the gap `force_tokens` cannot: `DON'T` is an
+apostrophe contraction, not a token that can be pinned, so pruning it to `'T`
+is invisible to prevention and obvious to comparison.
+
+Rejections are logged and recorded, so the rejection rate is measurable rather
+than invisible:
+
+```
+[WARN] Refined context: rejected a compressed message and kept the original
+       (negation 'not' lost (12x -> 11x); negation 'null' lost (4x -> 3x)).
+```
+
+Relax individual checks for an ablation:
+
+```python
+CompressionValidator(
+    negations=True, code_spans=True, identifiers=True, delimiters=False
+)
+```
+
+**What this revealed.** Replaying a real navidrome restart context through the
+validator, the Planner's 14,914-character plan was **rejected** — it lost one
+of twelve `not`s, one of four `null`s and two of twenty-five `nil`s. That
+message had previously been assumed fine because its ratio looked mild (94%).
+Faithful token-pruning of a code-heavy agent plan is harder than the ratio
+suggests; see §8 for what that leaves.
+
+
+---
+
+## 5b. Structure-aware compression of the newest message
+
+There are **two configurable modes**, and the config file picks between them:
+
+| `keep_last_verbatim` | the newest message | config |
+| --- | --- | --- |
+| `true` (default) | handed back **whole** | `inj_refinedctx/aegis_FM22.yaml` |
+| `false` | compressed **along its own labels** | `inj_refinedctx/aegis_FM22_structured.yaml` |
+
+The default is unchanged from before this mode existed: the newest message is
+what the node has to act on, so it goes back intact. Setting the flag to
+`false` gives the restart an `active_compressor` and the tail is compressed
+too — but along its structure rather than as one blob.
+
+Both on the same real contexts:
+
+| context | intact mode | structured mode |
+| --- | --- | --- |
+| first Coder, 1 message (10,178 ch) | unchanged, nothing compressed | 9,491 ch (93%), structure intact |
+| later Planner, 8 messages (19,029 ch) | 18,312 ch, tail unchanged at 5,024 | 18,024 ch, tail 5,024 → 4,736 |
+
+### Why a blob is the wrong shape
+
+An agent message in a ReAct loop is not prose, it is a form — and the form is
+not incidental. The target MAS declares itself one: the graph is
+`SWEBench_PlannerCoder_ReAct` and both role prompts open with *"You are a
+senior software engineer acting as a Planner / Coder in a ReAct loop"*
+([`swe_bench_planner_coder_react.yaml`][spec]). ReAct [\[1\]][react] is what
+puts `THOUGHT / ACTION / OBSERVATION` there: its contribution is interleaving
+a reasoning trace with task-specific actions, so the reasoning can revise the
+plan while the actions gather what the reasoning needs.
+
+That matters for compression because the two halves of the trace are not the
+same kind of content. The reasoning trace is the agent narrating a turn that
+has **already happened**; the report or plan at the end is the artefact the
+**next** agent consumes. Losing narration costs a restarted agent some of its
+own history. Losing a field the receiving agent's prompt tells it to read
+costs the loop its control flow.
+
+The Coder's prompt tells it to emit exactly these fields, and the Planner's
+prompt tells it to read them by name:
+
+```
+THOUGHT:         what the plan asked for              (restates what it was told)
+ACTION:          what it actually did
+OBSERVATION:     what it saw afterwards
+REPORT:
+  EDITS:           every file and change              (the record)
+  PLAN_DEVIATIONS: what it did differently
+  CONCERNS:        what the plan did not anticipate   (the Planner must rule on these)
+  REMAINING:       what is still outstanding          (gates completion)
+READY_FOR_REVIEW
+```
+
+Compressing that as one blob does two bad things. It applies **one rate to all
+of it**, so a THOUGHT that merely restates the plan is protected as carefully
+as a CONCERNS the reviewing Planner has to adjudicate. And it can dissolve the
+**labels themselves**, at which point the next agent cannot find the fields its
+prompt tells it to read.
+
+### What it does instead
+
+`StructuredCompressor` splits the message on its labels, compresses each body
+at that section's own rate, leaves the labels exactly as written, and puts it
+back in the same order. A section with `rate: null` is passed through
+untouched.
+
+### The policy, and the one rule behind it
+
+> **The last labelled block — `OUTPUT` for the Planner, `REPORT` for the
+> Coder — is the receiving agent's instruction, and is protected. The
+> `THOUGHT / ACTION / OBSERVATION` preamble is the agent's own narration of a
+> turn that already happened, and is the compressible part.**
+
+Cutting the narration hard is what pays for keeping the report intact. Which
+direction the message is going does not change the rule: a restarting Coder
+always has a Planner message last, a restarting Planner always has a Coder
+message last, and the two tables agree on the shared labels — so one map
+serves both, and the labels belonging to the other agent simply never appear.
+
+| section | rate | why |
+| --- | --- | --- |
+| `THOUGHT:` | 0.25 | restates the turn; ritual |
+| `ACTION:` | 0.30 | narrates tool calls already duplicated in `OBSERVATION` |
+| `OBSERVATION:` | 0.45 | interpretive prose — the paths and line numbers in it are protected spans |
+| `OUTPUT:` / `REPORT:` | **null** | the receiving agent's instruction |
+| `## Analysis` | 0.50 | superseded by the Fix Plan |
+| `## Fix Plan` | 0.55 | rationale prose only: its `###`/`####` headers and fenced code are protected spans |
+| `## Assumptions & Open Questions` | **null** | Coder step 1 validates each one |
+| `## Review Verdict`, `## PLAN_DEVIATIONS Review`, `## CONCERNS Review` | **null** | adjudications the Coder acts on |
+| `EDITS:` | 0.55 | change descriptions; the paths and ranges are protected spans |
+| `PLAN_DEVIATIONS:` | **null** | review step 4 requires accept-or-correct per item |
+| `CONCERNS:` | **null** | review step 3 requires a verdict per item, and it gates `TASK_COMPLETE` |
+| `REMAINING:` | **null** | short, and gates `READY_FOR_REVIEW` |
+
+`CONCERNS` is the one that matters most. The Planner's role block says it may
+emit `TASK_COMPLETE` only when "CONCERNS is 'none', OR every concern has been
+resolved". A concern lost to pruning lets the loop declare itself finished
+early — a correctness failure with no error signal, which is exactly the kind
+this loop cannot detect on its own. That is why it is `null` here *and*
+restated in the pinned block (§5c).
+
+Measured end to end on a realistic Planner plan + Coder report, with the
+history at 0.33: **924 → 675 tokens, 73.1% of the original**, with every file
+path, every line reference, every heading, the fenced code block, all the
+negations and all the harvested identifiers intact, and nothing rejected by
+the validator. The `EDITS` body came back untouched despite its 0.55: code and
+reference protection fragments it into prose runs shorter than
+`min_fragment_chars`, so the threshold keeps them. That is the safety net
+doing its job, but it does mean the rate on `EDITS` is largely inert.
+
+### Why not the library's own structured path
+
+LLMLingua ships `structured_compress_prompt`, which takes a prompt segmented
+with `<llmlingua, rate=..., compress=...>` tags and is the obvious way to give
+each field its own rate. It is not used, for one checkable reason: **it cannot
+carry `force_tokens`.** It forwards its arguments to `compress_prompt`
+positionally and stops before the token guards, with no `**kwargs` to slip
+them through — so negation pinning, the MAS's routing keywords, the harvested
+identifier allowlist and `force_reserve_digit` would all be silently dropped
+on that path. Splitting on the labels here and calling `compress_prompt` once
+per distinct rate gets the same per-field budget with the guards intact.
+
+That is asserted in `tests/recovery/test_structured.py` rather than only
+written down, because it is a property of the installed library: if a future
+version grows the parameter, the test fails and the decision is worth
+revisiting.
+
+### The first turn is the case to get right
+
+A node restarted on its **very first turn** has exactly one message — the plan
+a Coder was just handed. That message is simultaneously the oldest and the
+newest, so the head and the tail compete for it, and the tail wins: it is what
+the node has to act on, and it is the only way structure-aware compression can
+fire on a first turn at all.
+
+This was a bug worth naming, because it is silent. With the head taking
+priority the tail came out empty, nothing was compressed, and the restart
+quietly behaved like `RestartAllContext` — observed on a real run where the
+restarted Coder got the Planner's 10,178-character plan back byte for byte,
+with only a `skipped compression` line in the log to say so. For any context
+of two or more messages the split is unchanged.
+
+The guards were wrong in the same way: they asked whether the *history* was
+empty, so a context whose only compressible content was the tail skipped too.
+They now measure whatever is actually compressible, in both zones.
+
+### Writing the policy
+
+Labels are matched at the start of a line, case-insensitively, with or without
+their colon — so `'EDITS'` matches the `EDITS:           ` an agent actually
+emits. A field label must be followed by a colon, so a line of prose that
+merely begins with the word is not mistaken for a section. A `## Heading`
+label runs to the end of its line. Longer labels win over shorter ones, so
+`## CONCERNS Review` is not swallowed by `CONCERNS`.
+
+Text the structure does not account for — a preamble before the first label, a
+sub-heading not named in the policy — belongs to the section it sits in.
+`default_rate` covers a message with no labels at all, and `None` (the
+default) keeps such a message verbatim rather than guessing.
+
+```yaml
+restart:
+  mode: refinedcontext
+  keep_last: 1
+  keep_last_verbatim: false      # ← compress the newest message too
+  structure:
+    default_rate: null           # unlabelled text stays verbatim
+    # sections:                  # omit to use the MAS defaults
+    #   - {label: THOUGHT, rate: 0.3}
+    #   - {label: ACTION, rate: 0.9}
+    #   - {label: CONCERNS, rate: null}
+```
+
+Which labels exist and what each is worth is a property of the target MAS's
+prompts, so both live in the experiment config
+(`PLANNER_CODER_SECTIONS` in `FTOexperiments/src/config/fto_config.py`),
+derived from the two role prompts in
+`swe_bench_planner_coder_react.yaml` and confirmed against the labels the
+agents actually emit.
+
+### What still applies
+
+Everything from §5: code spans are protected inside each section, negations
+are pinned, short fragments are left alone, and the result goes through the
+same validator — a structured compression that eats a negation is rejected and
+the original message kept. The reported ratio and `restart.records` cover both
+zones, and the tail's record reads `compressed-structured` so it is
+distinguishable from the history's.
+
+One cost model note: one batched model call per *distinct rate*, not per
+section, so a policy with four rates costs four passes however many labels
+there are. And a section can come back a little *longer in characters* while
+being shorter in tokens — forced punctuation gets re-joined with spaces. The
+ratio is reported in tokens.
+
+## 5c. The pinned state block (Z1)
+
+Everything above is about making compression less destructive. This section is
+about the thing compression must not be trusted with at all.
+
+Three fields cross the agent boundary in this loop and are *state* rather than
+prose:
+
+- the Planner's `Assumptions & Open Questions` — Coder step 1: "Treat each
+  assumption as something to validate while you work."
+- the Coder's `CONCERNS` and `PLAN_DEVIATIONS` — Planner review steps 3 and 4
+  require a verdict per item, and `CONCERNS` gates `TASK_COMPLETE`.
+- what has actually been edited — review step 2 verifies each change with
+  `read_file_segment` against exact line numbers.
+
+So they are lifted out of the history, restated verbatim above the compressed
+history, and never shown to a compressor. `ResumptionState` builds the block;
+nothing in it calls a model.
+
+```
+── RESUMPTION STATE ──
+Resumed after a fault. This is turn 3, not your first turn: work from what is
+already recorded below rather than planning from scratch.
+LoopGuard: 1/8 counted turns consumed. A restart does not consume another: the
+faulty attempt's outgoing edges are withheld and only the successful attempt
+is released.
+OPEN ASSUMPTIONS (turn 2):
+  - wrap_var is only called from task_executor.py and from the templar; ...
+EDIT LEDGER:
+  lib/ansible/utils/unsafe_proxy.py -> lines 105-113, line 61   [turn 3]
+  lib/ansible/executor/task_executor.py -> line 31              [turn 3]
+PLAN_DEVIATIONS (turn 3):
+  I placed _wrap_set after _wrap_list rather than before it, ...
+OPEN CONCERNS (turn 3):
+  search_in_files shows a third caller in lib/ansible/vars/manager.py ...
+REMAINING (turn 3):
+  none
+The state block above is authoritative. Where the compressed history below
+conflicts with it, trust this block.
+```
+
+### The resumption marker is the part that is easy to skip
+
+Both role prompts open by asking the agent to place itself in the loop — the
+Planner's THOUGHT says "state whether this is your first turn (plan from
+scratch) or a review turn", the Coder's asks "what was already done in prior
+iterations?". A restarted agent handed an unmarked context answers "first
+turn", re-plans from scratch, and discards the work it was resuming. That is a
+silent failure of the whole restart, not of compression.
+
+### What it does and does not know
+
+- **Turn number** is the count of non-empty messages in the snapshot. In this
+  MAS one message is one agent turn, so it is exact; in a MAS where that is
+  not true, it is a proxy.
+- **The LoopGuard count** is the number of messages carrying the configured
+  turn marker (`EDITS`, i.e. Coder reports), against `max_iterations`.
+- **A restart does not consume a LoopGuard iteration**, and the block says so.
+  Checked in the harness rather than assumed: `MethodSwapEdgeSuppressor`
+  withholds the faulty attempt's outgoing edges and `reset()` drops them
+  between attempts, so only the successful attempt is released and the
+  `Coder → LoopGuard` edge fires once per logical turn.
+- **It does not adjudicate.** The spec asks for "unresolved concerns only" and
+  "unadjudicated deviations only". Deciding which concern a Planner verdict
+  has answered is a semantic judgement, and making it wrong in the silent
+  direction is exactly the failure the block exists to prevent. Instead the
+  *latest* statement of each field wins, which is sound here because both
+  agents restate these fields in full every turn. The edit ledger is the
+  exception and accumulates across turns.
+- **A trailing routing keyword is stripped** off the last field, because
+  `READY_FOR_REVIEW` trails `REMAINING` and belongs to the message rather than
+  to the field.
+
+### Pinning moves content; it should not copy it
+
+By default a pinned section is restated at the top *and* left where it was.
+For a section that is also `rate: null`, that is two verbatim copies of the
+same text, and it is expensive: measured on a real first-Coder restart, the
+seven assumption items appeared once in Z1 (1,304 chars) and again in the
+untouched `## Assumptions & Open Questions` tail (1,264 chars), and the
+reconstructed prompt came out **10.4% larger** than the message it replaced —
+compression saved 121 tokens while the block spent 392.
+
+Set `pin_pointer` on such a section and the body is replaced *in place* by a
+pointer line:
+
+```
+## Assumptions & Open Questions
+(see OPEN ASSUMPTIONS in the resumption state block above)
+```
+
+The label stays, so the message keeps its shape and the agent still finds the
+field where its prompt tells it to look; only the duplicate text goes. On that
+same run this recovered **1,204 chars / 268 tokens — 10.6% of the prompt** —
+and took the reconstruction from +10.4% to −1.3% against the original.
+
+Three rules keep it honest, none of them configurable:
+
+- **Only what the block actually quoted.** `latest_only` means an older turn's
+  concern is superseded in Z1 but is still the only record of its own wording,
+  so it keeps its body.
+- **Only when the pointer is shorter than the body.** `REMAINING: none` behind
+  a 52-character pointer is strictly worse, so it is left alone.
+- **Only once the block exists.** Nothing is stripped when `build` produced
+  no block, or the pointer would refer to nothing.
+
+A ledger field (`EDITS`) should *not* get a pointer: Z1 renders it as a
+`path -> line refs` summary rather than the original prose, so pointing at it
+loses the description.
+
+### Where it goes
+
+Immediately after the protected head and before the compressed history —
+prepended to the first entry that has text, so the one-text-per-message
+adapter contract is unchanged. With one message (a first-turn restart) that
+entry is the tail, and the block still lands in front of it.
+
+A skipped compression still gets the block. That case is the one that most
+needs it: a node restarted on its very first turn with `keep_last_verbatim:
+true` has nothing to compress at all, and without a marker it reads its own
+pending instruction as a fresh task and starts over. `restart.compressed`
+stays `False` there — the block is not compression, and a turn that carries it
+is not a refined turn.
+
+`restart.pinned_state` holds whatever was prepended, for auditing what the
+node was actually told. `resumption: false` in the config disables the block
+for an ablation.
+
+### The control-literal guard
+
+One smaller hazard, in the same family. The workflow's exit edge matches on
+literal output — `'(?s).*TASK_COMPLETE\s*$'`. A history entry that *compresses
+down to* something ending in that keyword satisfies the regex without any
+agent having decided anything. Any compressed history entry ending in a
+configured control literal gets a sentinel line (`[history]`) appended. The
+verbatim head and tail are never touched by it.
+
+---
+
+## 6. Keeping messages aligned
+
+The compressor returns **one compressed entry per input entry**, in the same
+order. That is a hard requirement, not a convenience.
+
+It matters because each compressed string is written back into the message it
+came from. Only the text changes — the role, the `metadata['source']`, the
+`keep` flag and any attachments stay exactly as they were. A compressed
+Planner message is still an assistant message from the Planner. That is what
+keeps the rebuilt list valid to send to a provider.
+
+Two consequences in the code:
+
+- `use_context_level_filter=False` is passed to LLMLingua-2 always. With it
+  on, the library drops whole entries, and the returned list no longer lines
+  up with the input. Alignment is worth more than that feature.
+- An empty compressed entry (`''`) means "leave that message alone". This is
+  how the verbatim tail is expressed, and it is also the safe outcome if a
+  history entry compresses down to nothing.
+
+Messages with nothing to rewrite never reach the model at all: empty content,
+attachment-only content, and tool-call/tool-result messages, whose pairing
+with each other would break if the text changed.
+
+---
+
+## 7. What this deliberately does not do
+
+Being clear about the gaps is more useful than pretending they are covered.
+
+**No question-conditioning.** LLMLingua-2 is task-agnostic. It scores the
+history uniformly and has no idea what the restarted node is about to do —
+compressing a plan produces the same output whether the pending review is
+about a null check or a CPE string. We verified this in the library rather
+than assuming it: `compress_prompt` forwards 17 parameters to the LLMLingua-2
+path and silently drops 23 of them, `question` and `instruction` among them.
+
+A compressor advertises whether it reads the question through `uses_question`,
+and the restart layer only builds one when that is True. So nothing in the
+code implies a conditioning that is not happening, and the log line records
+which it was. **Don't add `question=` back in LLMLingua-2 mode** — it will be
+discarded, and the next reader will believe it wasn't.
+
+(LongLLMLingua [\[4\]][longllmlingua] — `use_llmlingua2=False` — *is* query-aware, and is the only
+mode where `uses_question` is True. It needs a 7B model and ignores
+`force_tokens`, which is why it is not the default.)
+
+**No relevance-awareness at all, therefore.** The three safety nets are the
+*only* thing standing between a too-aggressive rate and a mangled history.
+Nothing in the pipeline notices when a rate is wrong for the content. Which is
+why the rate has to be needle-tested — see §10.
+
+**No age-tiering.** One `rate` is applied uniformly to every entry in the
+history zone. A two-band refinement — recent history at one rate, an archive
+reduced to a ledger stub — is a reasonable ablation and is not implemented.
+If you want one, build it above this class with two compressors rather than
+one call:
+
+```python
+older  = LLMLinguaCompressor(rate=0.35).compress(history[:-2])
+recent = LLMLinguaCompressor(rate=0.6).compress(history[-2:])
+texts  = older.texts + recent.texts          # chronological order preserved
+```
+
+`rate` is not part of the model cache key, so both share the loaded model at
+no extra cost in memory or load time. Needle testing so far says a flat rate
+is fine for ≤5-round Planner/Coder runs, so this is not implemented.
+
+---
+
+## 8. What it costs
+
+The scoring model is ~2 GB. It loads lazily on first use and is then cached
+per `(model, mode, device)` for the life of the process.
+
+Measured on a real 6-entry / ~11,900-character context:
+
+| | GPU | CPU |
+| --- | --- | --- |
+| model load (cold) | 7.0s | 1.1s |
+| compress, no protection | 1.0s | 8.9s |
+| compress, protected, `min_fragment_chars=0` | 12.5s | 109.1s |
+| compress, protected, `min_fragment_chars=80` | 2.7s | ~20s |
+
+**The trap:** in a real GKE run with `override_gpus: null` — no GPU — one
+compression took **606 seconds, 78% of the whole agent execution**. Most of
+that was CPU inference plus, most likely, downloading the 2 GB model inside a
+pod with a cold Hugging Face cache.
+
+If you run in containers: bake the model into the image, and give the pod a
+GPU if you can. Compression should be seconds, not minutes.
+
+### Is it even worth it? Read this before designing an experiment
+
+Protection lowers the compression ratio, because code no longer counts toward
+the savings. Stack all four nets and the saving on a real workload gets small:
+
+| configuration | achieved ratio | task spec |
+| --- | --- | --- |
+| no head protection, no validator | 86.8% | compressed to 62%, 5 of 6 key phrases lost |
+| `keep_first=1` + validator (current default) | **92.5%** | intact, all 6 phrases kept |
+
+**7.5% of tokens saved.** That is the honest number for a 17-message
+Planner context on a code-heavy Go instance: the instruction is protected, the
+plan is half backticked code and gets rejected by the validator for a lost
+negation, and what remains to compress is short exploration notes.
+
+Two consequences worth being explicit about:
+
+- On this kind of workload, a refined-context restart is **barely
+  distinguishable from an all-context restart**. If you are comparing the two
+  arms, check `restart.compressed` and the achieved ratio per turn before
+  attributing any difference to compression.
+- The semantic risk is unpaid for at that ratio. The two benefit gates exist
+  to say so out loud: `min_chars` skips compression when the compressible
+  history is small, and `min_saving` discards a compression that saved less
+  than a given fraction. Both default to off so existing configs keep their
+  behaviour; `min_saving=0.2` would have skipped this turn entirely.
+
+If you want a real token saving on this MAS, the lever is not a lower `rate` —
+it is compressing the content that actually holds the token mass. A Coder
+phase is hundreds of file reads and searches; that is low-sensitivity context
+and it never reaches the refined restart at all, because only the agents'
+final messages do.
+
+Lowering `rate` still buys prose back, and the code stays intact either way:
+
+| `rate` | ratio achieved | code kept | negations kept |
+| --- | --- | --- | --- |
+| 0.55 | 82.5% | 31/31 | 17/17 |
+| 0.4 | 75.3% | 31/31 | 17/17 |
+| 0.25 | 69.2% | 31/31 | 17/17 |
+| 0.15 | 64.8% | 31/31 | 17/17 |
+
+---
+
+## 9. The same answer on every attempt
+
+Compression runs **once per snapshot**. If `restart_count` is 3 and the node
+is still faulty after two attempts, the third replays the same refined text
+rather than paying for the model again.
+
+The refined *text* is what's cached, and the message list is rebuilt fresh on
+each attempt. That is deliberate: a restarted node is free to mutate the input
+it was handed, and the next attempt must not inherit that.
+
+A new snapshot (a different node, or the same node later) clears the cache and
+compresses again.
+
+---
+
+## 10. Choosing a rate — the needle test
+
+Since nothing in the pipeline can tell you a rate is too aggressive, the rate
+is validated by experiment, not by judgement.
+
+A needle test plants facts a restarted agent would be wrong without — a file
+path, a line range, a negation, a version string — compresses, and checks they
+came back. `tests/recovery/test_needle.py` is that gate. It loads the real
+model, so it is opt-in:
+
+```bash
+FTO_NEEDLE_TEST=1 pytest tests/recovery/test_needle.py -v
+```
+
+Results on Planner/Coder plans:
+
+| `rate` | verdict |
+| --- | --- |
+| 0.55 | every needle survived |
+| 0.4 | every needle survived |
+| 0.33 | every needle survived |
+| 0.25 | `lines 87-104` came back as `87` — a line *range* lost its end |
+
+That 0.25 row is what used to put the floor at 0.4. It no longer reproduces:
+line references are now held out of the compressor as protected spans rather
+than defended by `force_reserve_digit`, and ranges survive at 0.25 and 0.15
+too. The committed gate asserts 0.55, 0.4 and **0.33**, which is the rate the
+configs run at, plus unquoted paths, whole heading lines and harvested
+identifiers at 0.33 and 0.15.
+
+Re-run the gate if you change the rate, the force tokens, the protected
+spans, the model, or the shape of the agents' prompts.
+
+Two ways a needle test lies to you, both worth guarding against:
+
+- **A needle that is already in the haystack.** If the text already contains
+  the string elsewhere, "it survived" proves nothing. The committed test
+  asserts every needle occurs exactly once.
+- **A vacuous pass.** If nothing was actually compressed, every needle
+  survives trivially. The committed test asserts the ratio really moved.
+
+---
+
+## 11. When compression fails
+
+There is no safe default guess here. Silently falling back to uncompressed
+text makes a refined restart indistinguishable from an all-context one, and a
+benchmark that mixes the two without saying so cannot be read. So the choice
+is explicit:
+
+```python
+RestartRefinedContext(on_error=CompressionFailure.RAISE)        # default
+RestartRefinedContext(on_error=CompressionFailure.PASSTHROUGH)
+```
+
+- **`RAISE`** — the error propagates and the run fails. Nothing is recorded as
+  refined that was not refined.
+- **`PASSTHROUGH`** — falls back to the no-op `ContextCompressor`, logs a
+  warning saying *"This turn is NOT refined — exclude it when comparing
+  restart modes"*, and carries on.
+
+Either way, the restart records what happened, per turn:
+
+| field | meaning |
+| --- | --- |
+| `restart.compressed` | `True` compressed, `False` not, `None` not attempted yet |
+| `restart.failure` | why it wasn't, when it wasn't |
+| `restart.last_result` | the `CompressionResult`, including token counts |
+| `restart.records` | one `MessageRecord` per message: index, policy, chars before/after, validator failures |
+
+Read `compressed` when collecting results so a run never contains an
+invisible mix. `MessageRecord.policy` is one of `verbatim-head`,
+`verbatim-tail`, `compressed`, `compressed-structured`, `rejected` or
+`unchanged`, and `.mutated` compares chars before and after — **a
+`verbatim-head` record with `mutated=True` is a bug**, since the whole point
+of the protected head is that it comes back untouched. Worth asserting in any
+analysis script.
+
+One caveat for such a script: the record whose entry carries the pinned state
+block counts those characters in `chars_after`, so it can be *longer* than the
+original. That entry can be a `verbatim-tail` one on a first-turn restart.
+`restart.pinned_state` is the block itself if you want to subtract it.
+
+### A confound this is *not*
+
+If you diff a faulty node's input against the restarted node's input, the
+newest message will look shorter, and it is tempting to read that as
+compression truncating a message it promised to keep verbatim. It isn't.
+
+Verified on a real run: the faulty Planner's newest message was 5690
+characters, the restarted Planner's was 5018, and the 5018 is **byte-identical
+to the Coder's actual output**. The 672-character difference is the injected
+FM-2.2 payload, which the snapshot legitimately excludes because the snapshot
+is taken *before* the fault is applied. Nothing truncated anything.
+
+The related worry — "a fault that gets compressed away is not a fault that was
+survived" — is worth stating precisely. Every restart mode rewinds past the
+fault; that is what restoring a pre-fault snapshot means, and it is equally
+true of `RestartAllContext`. What FTO measures is recovery by rewind, not
+survival under a persisting fault. Fault *delivery* is separately enforced:
+`AegisFault.apply` raises `FaultInjectionError` if the injected text never
+reached the node, so a run cannot be scored as a recovery when no fault
+landed.
+
+---
+
+## 12. Configuration
+
+From the experiment side (`FTOexperiments/src/config/instances/inj_refinedctx/`):
+
+```yaml
+restart:
+  mode: refinedcontext
+  count: 1
+  keep_last: 1          # messages kept verbatim, newest first
+  keep_first: 1         # messages held out at the front (the instruction)
+  keep_last_verbatim: false  # false -> compress the tail along its labels (§5b)
+  resumption: true      # the pinned state block (§5c); false for an ablation
+  loop_guard_limit: 8   # the target MAS's loop_counter max_iterations
+  # control_literals: [TASK_COMPLETE, READY_FOR_REVIEW]   # omitted → defaults
+  on_error: raise       # raise | passthrough
+  min_chars: 0          # skip compression below this much history
+  min_saving: 0.0       # discard a compression that saved less than this
+  structure:
+    default_rate: 0.5             # fallback for text with no label
+    # sections: [...]             # omitted → PLANNER_CODER_SECTIONS
+  compression:
+    use_llmlingua2: true          # false = LongLLMLingua (7B, query-aware)
+    # model: microsoft/llmlingua-2-xlm-roberta-large-meetingbank
+    # device: cuda                # omitted → cuda if available, else cpu
+    rate: 0.33                    # fraction of tokens to keep, history zone
+    protect_code: true            # hold code spans out of the compressor
+    protect_identifiers: true     # and bare paths and line references
+    protect_headings: true        # and whole markdown heading lines
+    drop_consecutive: true        # collapse runs of the same forced token
+    min_fragment_chars: 80        # keep prose runs shorter than this verbatim
+    # force_tokens: [...]         # omitted → Planner/Coder defaults
+    # identifier_allowlist: [...] # omitted → harvested from the message
+    # target_token: -1            # hard budget; overrides rate
+    # params: {}                  # anything else compress_prompt accepts
+```
+
+Knobs that exist mainly for ablations: `protect_code: false`,
+`protect_identifiers: false`, `protect_headings: false`,
+`min_fragment_chars: 0` and `resumption: false` each reproduce the behaviour
+from before that guard existed, if you want to measure what it is worth. Note
+that the validator is independent of them — turning a protection off without
+also relaxing the matching validator check will get the messages rejected
+rather than compressed.
+
+---
+
+## 13. Extending it
+
+**A different compaction method.** Subclass `ContextCompressor`:
+
+```python
+class SummarizingCompressor(ContextCompressor):
+    uses_question = True       # if your method reads the question
+
+    def compress(self, contexts, question=''):
+        texts = [self.llm_summarize(c, question) for c in contexts]
+        return CompressionResult(texts, origin_tokens=..., compressed_tokens=...)
+```
+
+The contract is: **one entry out per entry in, same order**; `''` means "leave
+that message alone". The base class is a working no-op passthrough, which also
+makes it a usable stand-in for disabling compression without changing the
+restart mode.
+
+**A different MAS.** Implement two methods on your `NodeAdapter`:
+
+- `context_as_list(context)` — the context as plain text, one entry per
+  message; `''` where there is nothing a compressor may rewrite
+- `context_from_list(texts, context)` — the same context rebuilt with each
+  message's text replaced; `''` leaves that message untouched
+
+The `content_text` and `replace_content_text` helpers in
+`fto/adapters/node/node.py` handle the usual string and block-list content
+shapes, including keeping attachments in place.
+
+---
+
+## 14. Gotchas, in one place
+
+| | |
+| --- | --- |
+| Don't pass `question=` in LLMLingua-2 mode | It is discarded. Check `uses_question`. |
+| Don't add `'.'` to `force_tokens` | Breaks `6.4.6` into `6. 4. 6`. |
+| Don't *replace* `DEFAULT_FORCE_TOKENS` | Extend it, or you lose negation protection. |
+| Don't assume the threshold protects markers | It protects short *fragments*. Long messages need `force_tokens`. |
+| Don't assume literals are safe because they look like code | Protection is by backtick. Quote them. |
+| Don't run this on CPU in a container without checking | One run spent 606s (78% of execution) compressing. |
+| Don't change the rate without re-running the needle test | Nothing else will tell you it broke. |
+| Don't report a run as refined without checking `restart.compressed` | `PASSTHROUGH`, skipped and rejected turns are not refined. |
+| Don't try to protect prose by adding characters to `force_tokens` | Tested: recovers nothing, and `*`/`<`/`>` add spacing damage. Use `keep_first`. |
+| Don't read a shorter newest message as truncation | It is the fault payload the snapshot excludes. See §11. |
+| Don't assume a mild ratio means a faithful message | The plan compressed to 94% and still lost a negation. |
+| Don't compress a labelled agent message as one blob | It applies one rate to every field and can dissolve the labels. Use `keep_last_verbatim: false` with a `structure:` policy. |
+| Don't reach for `structured_compress_prompt` | It cannot carry `force_tokens` or `force_reserve_digit`. See §5b. |
+| Don't rely on backticks for paths and line numbers | Agents write most of them unquoted. `protect_identifiers` is what saves those. |
+| Don't defend a heading with `force_tokens` | Pinning `####` still yields `### # 1:`. `protect_headings` holds the whole line out. |
+| Don't turn a protection off without relaxing its validator check | You get mass rejection, not an ablation. |
+| Don't pin a section verbatim and leave it in place too | Two copies of the same text. Set `pin_pointer`; it recovered 10.6% of one real prompt. |
+| Don't give a ledger field a pointer | Z1 renders `EDITS` as a summary, not the prose. Pointing at it loses detail. |
+| Don't assume Z1 adjudicates | It restates the *latest* concerns and deviations, not the unresolved ones. See §5c. |
+| Don't restart an agent without a resumption marker | Both role prompts ask "is this your first turn?". It answers wrong, re-plans, and burns a LoopGuard iteration. |
+| Don't assume a first-turn restart compressed anything | With one message and `keep_last_verbatim: true` there is nothing to compress. Check `restart.compressed`. |
+
+---
+
+## 15. References
+
+The mechanism sits on two lines of work: the agent scaffold the target MAS is
+built from, and the prompt-compression family the compressor comes from.
+
+**[1]** <a id="react"></a>Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I.,
+Narasimhan, K., & Cao, Y. (2023). *ReAct: Synergizing Reasoning and Acting in
+Language Models.* ICLR 2023. [arXiv:2210.03629](https://arxiv.org/abs/2210.03629)
+
+> Why it is cited here: the `THOUGHT / ACTION / OBSERVATION` trace that §5b's
+> section policy keys on is ReAct's, and the MAS spec file declares itself a
+> ReAct loop. The split the policy makes — compress the reasoning trace of a
+> turn that already happened, protect the artefact the next agent consumes —
+> is a split ReAct's own structure hands you.
+
+**[2]** <a id="llmlingua"></a>Jiang, H., Wu, Q., Lin, C.-Y., Yang, Y., & Qiu,
+L. (2023). *LLMLingua: Compressing Prompts for Accelerated Inference of Large
+Language Models.* EMNLP 2023.
+[arXiv:2310.05736](https://arxiv.org/abs/2310.05736)
+
+> The original perplexity-based compressor and the budget controller. Not the
+> default here, but the `compress_prompt` API this code calls is its API.
+
+**[3]** <a id="llmlingua2"></a>Pan, Z., Wu, Q., Jiang, H., Xia, M., Luo, X.,
+Zhang, J., Lin, Q., Rühle, V., Yang, Y., Lin, C.-Y., Zhao, H. V., Qiu, L., &
+Zhang, D. (2024). *LLMLingua-2: Data Distillation for Efficient and Faithful
+Task-Agnostic Prompt Compression.* Findings of ACL 2024.
+[arXiv:2403.12968](https://arxiv.org/abs/2403.12968)
+
+> The default compressor (`use_llmlingua2=True`). Token classification over a
+> BERT-size encoder, distilled from GPT-4 on MeetingBank — which is where §4's
+> domain caveat comes from, and why it is task-agnostic and discards
+> `question` (§7).
+
+**[4]** <a id="longllmlingua"></a>Jiang, H., Wu, Q., Luo, X., Li, D., Lin,
+C.-Y., Yang, Y., & Qiu, L. (2024). *LongLLMLingua: Accelerating and Enhancing
+LLMs in Long Context Scenarios via Prompt Compression.* ACL 2024.
+[arXiv:2310.06839](https://arxiv.org/abs/2310.06839)
+
+> The query-aware variant, reached with `use_llmlingua2=False`. The only mode
+> where `uses_question` is True, and the reason that flag exists at all.
+
+[react]: https://arxiv.org/abs/2210.03629
+[llmlingua]: https://arxiv.org/abs/2310.05736
+[llmlingua2]: https://arxiv.org/abs/2403.12968
+[longllmlingua]: https://arxiv.org/abs/2310.06839
+[spec]: https://github.com/imoruz/FTOexperiments/blob/main/src/experiments/chatdev/instances/swe_bench_planner_coder_react.yaml
